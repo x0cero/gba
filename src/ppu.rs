@@ -570,6 +570,13 @@ pub struct Capture {
     pub bg_under: Vec<u32>,
     /// BG2 (ground layer) scroll registers, for metatile grid alignment.
     pub scroll: (u16, u16),
+    /// UI overlay: BG0 pixels that win compositing (dialogue boxes, menus).
+    /// 0 = transparent, else 0xFF000000 | color. In FRLG all textbox/menu
+    /// UI lives on BG0, which must never extrude into terrain.
+    pub ui_frame: Vec<u32>,
+    /// True when the picture is not a mode-0 overworld (intro, battles,
+    /// affine scenes): the diorama renderer should fall back to flat 2D.
+    pub fallback_2d: bool,
 }
 
 impl Capture {
@@ -586,7 +593,10 @@ impl Capture {
         self.bg_under.clear();
         self.bg_under.resize(WIDTH * HEIGHT, rgb555(backdrop555));
         self.sprite_pixels.clear();
+        self.ui_frame.clear();
+        self.ui_frame.resize(WIDTH * HEIGHT, 0);
         self.scroll = (r16(0x18) & 0x1FF, r16(0x1A) & 0x1FF);
+        self.fallback_2d = dispcnt & 7 != 0;
         if dispcnt & 0x80 != 0 {
             return; // forced blank
         }
@@ -616,8 +626,11 @@ impl Capture {
             let row = y as usize * WIDTH;
             for x in 0..WIDTH {
                 // Top BG pixel by priority, same search order as compositing.
+                // BG0 is the UI layer (dialogue, menus): captured separately
+                // as a flat overlay, never as terrain.
                 let mut bg_top: Option<(u16, u8, u8)> = None;
                 let mut bg_under: Option<u16> = None;
+                let mut ui: Option<u8> = None;
                 'bg: for prio in 0..4u8 {
                     for bg in 0..4usize {
                         if dispcnt & (1 << (8 + bg)) == 0
@@ -626,13 +639,19 @@ impl Capture {
                             continue;
                         }
                         let p = bg_line[bg][x];
-                        if p & 0x8000 != 0 {
-                            if bg_top.is_none() {
-                                bg_top = Some((p & 0x7FFF, prio, bg as u8));
-                            } else {
-                                bg_under = Some(p & 0x7FFF);
-                                break 'bg;
+                        if p & 0x8000 == 0 {
+                            continue;
+                        }
+                        if bg == 0 {
+                            if ui.is_none() && bg_top.is_none() {
+                                ui = Some(prio);
+                                self.ui_frame[row + x] = 0xFF00_0000 | rgb555(p & 0x7FFF);
                             }
+                        } else if bg_top.is_none() {
+                            bg_top = Some((p & 0x7FFF, prio, bg as u8));
+                        } else {
+                            bg_under = Some(p & 0x7FFF);
+                            break 'bg;
                         }
                     }
                 }
@@ -643,7 +662,10 @@ impl Capture {
                     self.bg_under[row + x] = rgb555(bg_under.unwrap_or(c));
                 }
                 let obj = &obj_line[x];
-                if obj.opaque && obj.prio <= bg_top.map_or(4, |(_, p, _)| p) {
+                if obj.opaque
+                    && obj.prio <= bg_top.map_or(4, |(_, p, _)| p)
+                    && ui.is_none_or(|up| obj.prio <= up)
+                {
                     self.sprite_pixels
                         .push((x as u8, y as u8, rgb555(obj.color)));
                 }

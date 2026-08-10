@@ -287,12 +287,39 @@ impl Renderer {
         }
     }
 
-    /// Draw one diorama frame from the captured layers.
-    pub fn render(&mut self, cap: &Capture) {
+    /// Blit a 240x160 frame at 3x nearest-neighbor, centered. `opaque_only`
+    /// skips zero (transparent) pixels — used for the flat UI overlay.
+    fn blit_2d(&mut self, frame: &[u32], opaque_only: bool) {
+        const X0: usize = (WIDTH - ppu::WIDTH * 3) / 2;
+        const Y0: usize = (HEIGHT - ppu::HEIGHT * 3) / 2;
+        for y in 0..ppu::HEIGHT {
+            for x in 0..ppu::WIDTH {
+                let c = frame[y * ppu::WIDTH + x];
+                if opaque_only && c & 0xFF00_0000 == 0 {
+                    continue;
+                }
+                let c = c & 0x00FF_FFFF;
+                for dy in 0..3 {
+                    let row = (Y0 + y * 3 + dy) * WIDTH + X0 + x * 3;
+                    self.buffer[row..row + 3].fill(c);
+                }
+            }
+        }
+    }
+
+    /// Draw one diorama frame from the captured layers. `flat` is the PPU's
+    /// real 2D framebuffer, used verbatim when the scene is not a mode-0
+    /// overworld (intro, battles) or when UI covers most of the picture.
+    pub fn render(&mut self, cap: &Capture, flat: &[u32]) {
         self.buffer.copy_from_slice(&self.background);
         self.zbuf.fill(f32::INFINITY);
         if cap.bg_frame.len() < ppu::WIDTH * ppu::HEIGHT {
             return; // no capture yet (first frame)
+        }
+        let ui_pixels = cap.ui_frame.iter().filter(|&&c| c != 0).count();
+        if cap.fallback_2d || ui_pixels > ppu::WIDTH * ppu::HEIGHT / 2 {
+            self.blit_2d(flat, false);
+            return;
         }
         self.build_heights(cap);
 
@@ -317,6 +344,11 @@ impl Renderer {
         self.render_walls(cap);
 
         self.render_sprites_entry(cap);
+        // Dialogue boxes and menus (BG0) composite flat in screen space on
+        // top of the finished 3D scene — UI must never extrude.
+        if ui_pixels > 0 {
+            self.blit_2d(&cap.ui_frame, true);
+        }
     }
 
     /// Walls at height discontinuities. Faces are merged over runs of equal

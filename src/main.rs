@@ -144,7 +144,7 @@ fn main() -> ExitCode {
                     match (&mut capture, &mut diorama) {
                         (Some(cap), Some(dio)) => {
                             cap.run(&cpu.bus.io, &cpu.bus.palette, &cpu.bus.vram, &cpu.bus.oam);
-                            dio.render(cap);
+                            dio.render(cap, &cpu.bus.ppu.framebuffer);
                             dump_frame(
                                 &dio.buffer,
                                 voxel::WIDTH,
@@ -179,7 +179,7 @@ fn main() -> ExitCode {
         match (&mut capture, &mut diorama) {
             (Some(cap), Some(dio)) => {
                 cap.run(&cpu.bus.io, &cpu.bus.palette, &cpu.bus.vram, &cpu.bus.oam);
-                dio.render(cap);
+                dio.render(cap, &cpu.bus.ppu.framebuffer);
                 dump_frame(&dio.buffer, voxel::WIDTH, voxel::HEIGHT, "frame.ppm");
                 // GBA_BENCH: time capture + diorama render on the final frame.
                 if env::var("GBA_BENCH").is_ok() {
@@ -190,7 +190,7 @@ fn main() -> ExitCode {
                     let tc = t.elapsed() / 100;
                     let t = std::time::Instant::now();
                     for _ in 0..100 {
-                        dio.render(cap);
+                        dio.render(cap, &cpu.bus.ppu.framebuffer);
                     }
                     eprintln!("capture avg: {:.2?}, render avg: {:.2?}", tc, t.elapsed() / 100);
                 }
@@ -424,7 +424,7 @@ fn main() -> ExitCode {
             match (&mut capture, &mut diorama) {
                 (Some(cap), Some(dio)) => {
                     cap.run(&cpu.bus.io, &cpu.bus.palette, &cpu.bus.vram, &cpu.bus.oam);
-                    dio.render(cap);
+                    dio.render(cap, &cpu.bus.ppu.framebuffer);
                     presented.copy_from_slice(&dio.buffer);
                 }
                 _ => presented.copy_from_slice(&cpu.bus.ppu.framebuffer),
