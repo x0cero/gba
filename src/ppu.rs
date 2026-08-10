@@ -562,6 +562,12 @@ pub struct Capture {
     pub sprite_pixels: Vec<(u8, u8, u32)>,
     /// Priority (0-3) of the winning BG layer per pixel; 4 = backdrop.
     pub bg_prio: Vec<u8>,
+    /// Index (0-3) of the winning BG layer per pixel; 4 = backdrop.
+    pub bg_layer: Vec<u8>,
+    /// Color of the winning pixel among BG layers *below* the winner
+    /// (the "ground under the overlay"); equals bg_frame where only one
+    /// layer is opaque. Used to paint terrain under raised scenery.
+    pub bg_under: Vec<u32>,
 }
 
 impl Capture {
@@ -573,6 +579,10 @@ impl Capture {
         self.bg_frame.resize(WIDTH * HEIGHT, rgb555(backdrop555));
         self.bg_prio.clear();
         self.bg_prio.resize(WIDTH * HEIGHT, 4);
+        self.bg_layer.clear();
+        self.bg_layer.resize(WIDTH * HEIGHT, 4);
+        self.bg_under.clear();
+        self.bg_under.resize(WIDTH * HEIGHT, rgb555(backdrop555));
         self.sprite_pixels.clear();
         if dispcnt & 0x80 != 0 {
             return; // forced blank
@@ -603,7 +613,8 @@ impl Capture {
             let row = y as usize * WIDTH;
             for x in 0..WIDTH {
                 // Top BG pixel by priority, same search order as compositing.
-                let mut bg_top: Option<(u16, u8)> = None;
+                let mut bg_top: Option<(u16, u8, u8)> = None;
+                let mut bg_under: Option<u16> = None;
                 'bg: for prio in 0..4u8 {
                     for bg in 0..4usize {
                         if dispcnt & (1 << (8 + bg)) == 0
@@ -613,17 +624,23 @@ impl Capture {
                         }
                         let p = bg_line[bg][x];
                         if p & 0x8000 != 0 {
-                            bg_top = Some((p & 0x7FFF, prio));
-                            break 'bg;
+                            if bg_top.is_none() {
+                                bg_top = Some((p & 0x7FFF, prio, bg as u8));
+                            } else {
+                                bg_under = Some(p & 0x7FFF);
+                                break 'bg;
+                            }
                         }
                     }
                 }
-                if let Some((c, prio)) = bg_top {
+                if let Some((c, prio, layer)) = bg_top {
                     self.bg_frame[row + x] = rgb555(c);
                     self.bg_prio[row + x] = prio;
+                    self.bg_layer[row + x] = layer;
+                    self.bg_under[row + x] = rgb555(bg_under.unwrap_or(c));
                 }
                 let obj = &obj_line[x];
-                if obj.opaque && obj.prio <= bg_top.map_or(4, |(_, p)| p) {
+                if obj.opaque && obj.prio <= bg_top.map_or(4, |(_, p, _)| p) {
                     self.sprite_pixels
                         .push((x as u8, y as u8, rgb555(obj.color)));
                 }

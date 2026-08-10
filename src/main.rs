@@ -176,6 +176,35 @@ fn main() -> ExitCode {
                 cap.run(&cpu.bus.io, &cpu.bus.palette, &cpu.bus.vram, &cpu.bus.oam);
                 dio.render(cap);
                 dump_frame(&dio.buffer, voxel::WIDTH, voxel::HEIGHT, "frame.ppm");
+                // GBA_BENCH: time capture + diorama render on the final frame.
+                if env::var("GBA_BENCH").is_ok() {
+                    let t = std::time::Instant::now();
+                    for _ in 0..100 {
+                        cap.run(&cpu.bus.io, &cpu.bus.palette, &cpu.bus.vram, &cpu.bus.oam);
+                        dio.render(cap);
+                    }
+                    eprintln!("capture+render avg: {:.2?}", t.elapsed() / 100);
+                }
+                // GBA_DUMP_LAYERS: false-color map of which BG layer won each
+                // pixel (R=bg0, G=bg1, B=bg2, R+G=bg3), brightness = priority.
+                if env::var("GBA_DUMP_LAYERS").is_ok() {
+                    let dbg: Vec<u32> = cap
+                        .bg_layer
+                        .iter()
+                        .zip(&cap.bg_prio)
+                        .map(|(&l, &p)| {
+                            let v = 255 - p.min(3) as u32 * 60;
+                            match l {
+                                0 => v << 16,
+                                1 => v << 8,
+                                2 => v,
+                                3 => v << 16 | v << 8,
+                                _ => 0x202020,
+                            }
+                        })
+                        .collect();
+                    dump_frame(&dbg, ppu::WIDTH, ppu::HEIGHT, "layers.ppm");
+                }
             }
             _ => dump_frame(&cpu.bus.ppu.framebuffer, ppu::WIDTH, ppu::HEIGHT, "frame.ppm"),
         }
