@@ -25,8 +25,8 @@ const CY: f32 = 236.0;
 
 /// Extrusion heights per scenery class, in world units.
 const H_OVERLAY: f32 = 16.0; // BG1: house bodies, roofs, tree canopies
-const H_PROP: f32 = 9.0; // BG3: fences, signs, mailboxes
-const H_GRASS: f32 = 3.0; // BG3 tiles that are dominantly green: tall grass
+const H_PROP: f32 = 5.5; // BG3: fences, signs, mailboxes
+const H_GRASS: f32 = 1.5; // BG3 tiles that are dominantly green: tall grass
 /// Terrain height is clamped to 2 units per map pixel of distance from the
 /// frame edge, so scenery scrolling in grows out of the ground instead of
 /// popping in as a bare wall slab.
@@ -129,6 +129,59 @@ impl Renderer {
         self.tri([q[0], q[2], q[3]], color, dim);
     }
 
+    /// Z-buffered textured triangle: uv interpolated barycentrically,
+    /// color from `sample(u, v)`.
+    fn tri_uv(
+        &mut self,
+        p: [(f32, f32, f32); 3],
+        uv: [(f32, f32); 3],
+        sample: &mut impl FnMut(f32, f32) -> u32,
+    ) {
+        let area = (p[1].0 - p[0].0) * (p[2].1 - p[0].1) - (p[1].1 - p[0].1) * (p[2].0 - p[0].0);
+        if area.abs() < 1e-6 {
+            return;
+        }
+        let min_x = (p[0].0.min(p[1].0).min(p[2].0).floor().max(0.0)) as usize;
+        let max_x = (p[0].0.max(p[1].0).max(p[2].0).ceil()).min(WIDTH as f32 - 1.0) as usize;
+        let min_y = (p[0].1.min(p[1].1).min(p[2].1).floor().max(0.0)) as usize;
+        let max_y = (p[0].1.max(p[1].1).max(p[2].1).ceil()).min(HEIGHT as f32 - 1.0) as usize;
+        let inv = 1.0 / area;
+        for y in min_y..=max_y {
+            let fy = y as f32 + 0.5;
+            for x in min_x..=max_x {
+                let fx = x as f32 + 0.5;
+                let w0 = ((p[1].0 - fx) * (p[2].1 - fy) - (p[1].1 - fy) * (p[2].0 - fx)) * inv;
+                let w1 = ((p[2].0 - fx) * (p[0].1 - fy) - (p[2].1 - fy) * (p[0].0 - fx)) * inv;
+                let w2 = 1.0 - w0 - w1;
+                // Slightly tolerant edge test so abutting quads never leave
+                // one-pixel seams between their coverage regions.
+                const E: f32 = -0.002;
+                if w0 < E || w1 < E || w2 < E {
+                    continue;
+                }
+                let z = w0 * p[0].2 + w1 * p[1].2 + w2 * p[2].2;
+                let i = y * WIDTH + x;
+                if z < self.zbuf[i] {
+                    let u = w0 * uv[0].0 + w1 * uv[1].0 + w2 * uv[2].0;
+                    let v = w0 * uv[0].1 + w1 * uv[1].1 + w2 * uv[2].1;
+                    self.zbuf[i] = z;
+                    self.buffer[i] = sample(u, v);
+                }
+            }
+        }
+    }
+
+    /// Textured quad: vertices clockwise from top-left, uv (0,0) at q[0],
+    /// (1,0) at q[1], (1,1) at q[2], (0,1) at q[3].
+    fn quad_uv(
+        &mut self,
+        q: [(f32, f32, f32); 4],
+        sample: &mut impl FnMut(f32, f32) -> u32,
+    ) {
+        self.tri_uv([q[0], q[1], q[2]], [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)], sample);
+        self.tri_uv([q[0], q[2], q[3]], [(0.0, 0.0), (1.0, 1.0), (0.0, 1.0)], sample);
+    }
+
     /// Flat textured row-strip: map pixels px0..px1 of row py at height h,
     /// colored from `row`. Depth is constant along each screen scanline of
     /// the strip, so linear interpolation is exact for this camera.
@@ -168,20 +221,6 @@ impl Renderer {
                 }
             }
         }
-    }
-
-    /// Vertical wall along a cell edge from height h0 up to h1. `axis` 0 =
-    /// wall runs along x (south/north face), 1 = along z (east/west face).
-    fn wall(&mut self, px: f32, py: f32, axis: u8, h0: f32, h1: f32, color: u32) {
-        let (ax, _, az) = world(px, py, 0.0);
-        let (bx, bz) = if axis == 0 { (ax + 1.0, az) } else { (ax, az - 1.0) };
-        let q = [
-            project(ax, h1, az),
-            project(bx, h1, bz),
-            project(bx, h0, bz),
-            project(ax, h0, az),
-        ];
-        self.quad(q, color, None);
     }
 
     /// Terrain height per map pixel. Classified per 16x16 metatile aligned
@@ -274,30 +313,109 @@ impl Renderer {
                 self.strip(px0, px1, py, h, row_vec);
                 px0 = px1;
             }
-            for px in 0..ppu::WIDTH {
-                let i = hrow + px;
-                let h = self.height[i];
-                if h <= 0.0 {
+        }
+        self.render_walls(cap);
+
+        self.render_sprites_entry(cap);
+    }
+
+    /// Walls at height discontinuities. Faces are merged over runs of equal
+    /// (top, bottom) height so neighboring columns never rasterize seams,
+    /// and textured from the block's own map pixels (rows behind the face
+    /// for south walls, columns into the block for side walls), darkened.
+    /// This is what keeps a 16-unit tree face looking like tree art instead
+    /// of a single pixel row smeared into vertical stripes.
+    fn render_walls(&mut self, cap: &Capture) {
+        const W: usize = ppu::WIDTH;
+        const H: usize = ppu::HEIGHT;
+        // Take the heightfield out of self so the raster methods can borrow
+        // self mutably while we read it.
+        let height = std::mem::take(&mut self.height);
+        let hgt = |x: usize, y: usize| height[y * W + x];
+        // South-facing walls (toward the camera), merged along x.
+        for py in 0..H {
+            let mut px0 = 0;
+            while px0 < W {
+                let h = hgt(px0, py);
+                let hs = if py + 1 < H { hgt(px0, py + 1) } else { h };
+                if !(h > 0.0 && hs < h) {
+                    px0 += 1;
                     continue;
                 }
-                let color = cap.bg_frame[i];
-                // South wall (faces the camera).
-                let hs = if py + 1 < ppu::HEIGHT { self.height[i + ppu::WIDTH] } else { h };
-                if hs < h {
-                    self.wall(px as f32, py as f32 + 1.0, 0, hs, h, shade(color, 0.55));
+                let mut px1 = px0 + 1;
+                while px1 < W
+                    && hgt(px1, py) == h
+                    && (if py + 1 < H { hgt(px1, py + 1) } else { h }) == hs
+                {
+                    px1 += 1;
                 }
-                // West / east walls.
-                let hw = if px > 0 { self.height[i - 1] } else { h };
-                if hw < h {
-                    self.wall(px as f32, py as f32, 1, hw, h, shade(color, 0.42));
-                }
-                let he = if px + 1 < ppu::WIDTH { self.height[i + 1] } else { h };
-                if he < h {
-                    self.wall(px as f32 + 1.0, py as f32, 1, he, h, shade(color, 0.42));
+                let (ax, _, az) = world(px0 as f32, py as f32 + 1.0, 0.0);
+                let bx = ax + (px1 - px0) as f32;
+                let q = [
+                    project(ax, h, az),
+                    project(bx, h, az),
+                    project(bx, hs, az),
+                    project(ax, hs, az),
+                ];
+                let (n, dh) = ((px1 - px0) as f32, h - hs);
+                self.quad_uv(q, &mut |u: f32, v: f32| {
+                    let col = px0 + ((u * n) as usize).min(px1 - px0 - 1);
+                    let row = py.saturating_sub((v.max(0.0) * dh) as usize);
+                    shade(cap.bg_frame[row * W + col], 0.55)
+                });
+                px0 = px1;
+            }
+        }
+        // West / east side walls, merged along y.
+        for px in 0..W {
+            for west in [true, false] {
+                let mut py0 = 0;
+                while py0 < H {
+                    let h = hgt(px, py0);
+                    let hn = match west {
+                        true if px > 0 => hgt(px - 1, py0),
+                        false if px + 1 < W => hgt(px + 1, py0),
+                        _ => h,
+                    };
+                    if !(h > 0.0 && hn < h) {
+                        py0 += 1;
+                        continue;
+                    }
+                    let mut py1 = py0 + 1;
+                    while py1 < H && hgt(px, py1) == h && {
+                        let n2 = match west {
+                            true if px > 0 => hgt(px - 1, py1),
+                            false if px + 1 < W => hgt(px + 1, py1),
+                            _ => h,
+                        };
+                        n2 == hn
+                    } {
+                        py1 += 1;
+                    }
+                    let plane = if west { px as f32 } else { px as f32 + 1.0 };
+                    let (ax, _, az0) = world(plane, py0 as f32, 0.0);
+                    let az1 = az0 - (py1 - py0) as f32;
+                    let q = [
+                        project(ax, h, az0),
+                        project(ax, h, az1),
+                        project(ax, hn, az1),
+                        project(ax, hn, az0),
+                    ];
+                    let (n, dh) = ((py1 - py0) as f32, h - hn);
+                    self.quad_uv(q, &mut |u: f32, v: f32| {
+                        let row = py0 + ((u * n) as usize).min(py1 - py0 - 1);
+                        let k = (v.max(0.0) * dh) as usize;
+                        let col = if west { (px + k).min(W - 1) } else { px.saturating_sub(k) };
+                        shade(cap.bg_frame[row * W + col], 0.42)
+                    });
+                    py0 = py1;
                 }
             }
         }
+        self.height = height;
+    }
 
+    fn render_sprites_entry(&mut self, cap: &Capture) {
         if std::env::var("GBA_SPR_DEBUG").is_ok() {
             eprintln!("sprite pixels: {}", cap.sprite_pixels.len());
         }
