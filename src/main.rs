@@ -144,7 +144,7 @@ fn main() -> ExitCode {
                     match (&mut capture, &mut diorama) {
                         (Some(cap), Some(dio)) => {
                             cap.run(&cpu.bus.io, &cpu.bus.palette, &cpu.bus.vram, &cpu.bus.oam);
-                            dio.render(cap, &cpu.bus.ppu.framebuffer);
+                            dio.render(cap, &cpu.bus.ppu.framebuffer, voxel::MapGrid::read(&cpu.bus).as_ref());
                             dump_frame(
                                 &dio.buffer,
                                 voxel::WIDTH,
@@ -179,7 +179,7 @@ fn main() -> ExitCode {
         match (&mut capture, &mut diorama) {
             (Some(cap), Some(dio)) => {
                 cap.run(&cpu.bus.io, &cpu.bus.palette, &cpu.bus.vram, &cpu.bus.oam);
-                dio.render(cap, &cpu.bus.ppu.framebuffer);
+                dio.render(cap, &cpu.bus.ppu.framebuffer, voxel::MapGrid::read(&cpu.bus).as_ref());
                 dump_frame(&dio.buffer, voxel::WIDTH, voxel::HEIGHT, "frame.ppm");
                 // GBA_BENCH: time capture + diorama render on the final frame.
                 if env::var("GBA_BENCH").is_ok() {
@@ -190,9 +190,52 @@ fn main() -> ExitCode {
                     let tc = t.elapsed() / 100;
                     let t = std::time::Instant::now();
                     for _ in 0..100 {
-                        dio.render(cap, &cpu.bus.ppu.framebuffer);
+                        dio.render(cap, &cpu.bus.ppu.framebuffer, voxel::MapGrid::read(&cpu.bus).as_ref());
                     }
                     eprintln!("capture avg: {:.2?}, render avg: {:.2?}", tc, t.elapsed() / 100);
+                }
+                // GBA_GRID_DEBUG: 2D frame tinted by RAM map-grid class, to
+                // verify screen-to-grid alignment (green=grass, blue=water,
+                // red=blocked with brightness by height).
+                if env::var("GBA_GRID_DEBUG").is_ok() {
+                    let mut dbg = cpu.bus.ppu.framebuffer;
+                    if let Some(g) = voxel::MapGrid::read(&cpu.bus) {
+                        for (i, px) in dbg.iter_mut().enumerate() {
+                            let (x, y) = (i % ppu::WIDTH, i / ppu::WIDTH);
+                            let cx = ((x + g.fine.0) / 16).min(voxel::MapGrid::COLS - 1);
+                            let cy = ((y + g.fine.1) / 16).min(voxel::MapGrid::ROWS - 1);
+                            let tint = match g.cells[cy * voxel::MapGrid::COLS + cx] {
+                                voxel::Cell::Flat => 0,
+                                voxel::Cell::Grass => 0x0000_C000,
+                                voxel::Cell::Water => 0x0000_00C0,
+                                voxel::Cell::Block(h, ..) => (0x60 + h as u32 * 2).min(255) << 16,
+                            };
+                            let mix = |a: u32, b: u32, s: u32| {
+                                ((a >> s & 0xFF) / 2 + (b >> s & 0xFF) / 2) << s
+                            };
+                            *px = mix(*px, tint, 16) | mix(*px, tint, 8) | mix(*px, tint, 0);
+                        }
+                    } else {
+                        let ew32 = |o: usize| {
+                            u32::from_le_bytes(cpu.bus.ewram[o..o + 4].try_into().unwrap())
+                        };
+                        let iw32 = |o: usize| {
+                            u32::from_le_bytes(cpu.bus.iwram[o..o + 4].try_into().unwrap())
+                        };
+                        eprint!("grid debug: MapGrid::read failed; sb1={:08X};", iw32(0x5008));
+                        for o in (0..0x3FFF0).step_by(4) {
+                            if ew32(o) == 0x0203_1DFC {
+                                eprint!(" ew@{:05X} (w={} h={})", o, ew32(o - 8), ew32(o - 4));
+                            }
+                        }
+                        for o in (8..0x7FF0).step_by(4) {
+                            if iw32(o) == 0x0203_1DFC {
+                                eprint!(" iw@{:04X} (w={} h={})", o, iw32(o - 8), iw32(o - 4));
+                            }
+                        }
+                        eprintln!();
+                    }
+                    dump_frame(&dbg, ppu::WIDTH, ppu::HEIGHT, "grid.ppm");
                 }
                 // GBA_DUMP_LAYERS: false-color map of which BG layer won each
                 // pixel (R=bg0, G=bg1, B=bg2, R+G=bg3), brightness = priority.
@@ -424,7 +467,7 @@ fn main() -> ExitCode {
             match (&mut capture, &mut diorama) {
                 (Some(cap), Some(dio)) => {
                     cap.run(&cpu.bus.io, &cpu.bus.palette, &cpu.bus.vram, &cpu.bus.oam);
-                    dio.render(cap, &cpu.bus.ppu.framebuffer);
+                    dio.render(cap, &cpu.bus.ppu.framebuffer, voxel::MapGrid::read(&cpu.bus).as_ref());
                     presented.copy_from_slice(&dio.buffer);
                 }
                 _ => presented.copy_from_slice(&cpu.bus.ppu.framebuffer),

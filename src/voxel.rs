@@ -8,14 +8,16 @@
 //! dependencies. Terrain tops are drawn as textured trapezoid row-strips
 //! (exact for this camera: depth is constant along a screen scanline of a
 //! flat strip), which keeps a busy forest scene around ~2ms.
+use gba::bus::Bus;
 use gba::ppu::{self, Capture};
 
 pub const WIDTH: usize = 800;
 pub const HEIGHT: usize = 500;
 
-/// Camera pitch down from horizontal: 52 degrees.
-const SIN_P: f32 = 0.788_010_7;
-const COS_P: f32 = 0.615_661_5;
+/// Camera pitch down from horizontal: 35 degrees (the reference mod's
+/// default diorama tilt).
+const SIN_P: f32 = 0.573_576_4;
+const COS_P: f32 = 0.819_152;
 /// Camera distance from the diorama center (world units = GBA pixels).
 const CAM_DIST: f32 = 340.0;
 /// Focal length in screen pixels.
@@ -56,12 +58,164 @@ fn world(px: f32, py: f32, h: f32) -> (f32, f32, f32) {
     (px - ppu::WIDTH as f32 / 2.0, h, ppu::HEIGHT as f32 / 2.0 - py)
 }
 
+/// One screen-visible map cell classified from the game's own state.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Cell {
+    Flat,
+    Grass, // MB_TALL_GRASS etc: a walk-through overlay, never geometry
+    Water, // flat, slightly sunken so shorelines get a lip
+    Block(f32, u8, u8), // blocked volume: (height, rows above, column rows)
+}
+
+/// The visible portion of FireRed's live map grid, read straight from
+/// emulator RAM each frame (the reference mod's approach: geometry comes
+/// from the game's collision/behavior data, not from art color guesses).
+pub struct MapGrid {
+    /// Fine scroll of the top-left visible cell, 0..15 pixels.
+    pub fine: (usize, usize),
+    /// COLS x ROWS cells covering the screen (plus one for fine scroll).
+    pub cells: Vec<Cell>,
+}
+
+impl MapGrid {
+    pub const COLS: usize = ppu::WIDTH / 16 + 1;
+    pub const ROWS: usize = ppu::HEIGHT / 16 + 1;
+
+    /// FireRed (US Rev 1) addresses: gBackupMapLayout (width, height, grid
+    /// pointer; the grid is the LIVE map with a 7-cell border margin),
+    /// gMapHeader (-> ROM map layout -> tilesets -> metatile attributes),
+    /// gSaveBlock1Ptr (player map coordinates = camera).
+    pub fn read(bus: &Bus) -> Option<MapGrid> {
+        let rd8 = |a: u32| -> Option<u8> {
+            match a >> 24 {
+                0x02 => bus.ewram.get((a as usize) & 0x3_FFFF).copied(),
+                0x03 => bus.iwram.get((a as usize) & 0x7FFF).copied(),
+                0x08..=0x09 => bus.rom.get((a as usize) - 0x0800_0000).copied(),
+                _ => None,
+            }
+        };
+        let rd16 = |a: u32| Some(u16::from_le_bytes([rd8(a)?, rd8(a + 1)?]));
+        let rd32 =
+            |a: u32| Some(u32::from_le_bytes([rd8(a)?, rd8(a + 1)?, rd8(a + 2)?, rd8(a + 3)?]));
+
+        let vwidth = rd32(0x0300_5040)? as i32; // map width + 15 border cells
+        let vheight = rd32(0x0300_5044)? as i32;
+        let grid_ptr = rd32(0x0300_5048)?;
+        if !(1..=1024).contains(&vwidth) || !(1..=1024).contains(&vheight) || grid_ptr >> 24 != 2 {
+            return None;
+        }
+        let sb1 = rd32(0x0300_5008)?;
+        if sb1 >> 24 != 2 {
+            return None;
+        }
+        let px = rd16(sb1)? as i16 as i32;
+        let py = rd16(sb1 + 2)? as i16 as i32;
+        let layout = rd32(0x0203_6DFC)?;
+        let attrs = |tileset: u32| -> Option<u32> {
+            let t = rd32(tileset)?;
+            (t >> 24 == 8 || t >> 24 == 9).then_some(t).and_then(|t| rd32(t + 0x10))
+        };
+        let (prim, sec) = (attrs(layout + 0x10)?, attrs(layout + 0x14)?);
+
+        // Live grid entry: metatile id 0-9, collision 10-11, elevation 12-15.
+        // VMap coordinates are map coordinates + 7 (the border margin).
+        let entry = |gx: i32, gy: i32| -> Option<u16> {
+            let (vx, vy) = (gx + 7, gy + 7);
+            if vx < 0 || vy < 0 || vx >= vwidth || vy >= vheight {
+                return None;
+            }
+            rd16(grid_ptr + ((vy * vwidth + vx) * 2) as u32)
+        };
+        let behavior = |e: u16| -> u32 {
+            let m = (e & 0x3FF) as u32;
+            let a = if m < 0x280 {
+                rd32(prim + m * 4)
+            } else {
+                rd32(sec + (m - 0x280) * 4)
+            };
+            a.unwrap_or(0) & 0x3FF
+        };
+        let blocked = |gx: i32, gy: i32| entry(gx, gy).is_some_and(|e| e >> 10 & 3 != 0);
+
+        // Screen top-left cell: the player cell is centered at screen cell
+        // (7, 5); fine scroll from the ground layer's BG registers.
+        let r16io = |off: usize| u16::from_le_bytes([bus.io[off], bus.io[off + 1]]);
+        let (hofs, vofs) = (r16io(0x18) & 0x1FF, r16io(0x1A) & 0x1FF);
+        let (gx0, gy0) = (px - 7, py - 5);
+
+        let mut cells = Vec::with_capacity(Self::COLS * Self::ROWS);
+        for cy in 0..Self::ROWS as i32 {
+            for cx in 0..Self::COLS as i32 {
+                let (gx, gy) = (gx0 + cx, gy0 + cy);
+                let Some(e) = entry(gx, gy) else {
+                    cells.push(Cell::Flat);
+                    continue;
+                };
+                if e >> 10 & 3 != 0 {
+                    // Volume height from the map's own tiling, the repeat
+                    // detector idea: walk up the blocked column collecting
+                    // metatile ids; a repeating pattern (period 1 or 2) is
+                    // rows of one thing -- trees -- so the volume is one
+                    // period tall, while a distinct stack (a house) rises
+                    // with it, capped at 3 rows (48 px).
+                    let mut ids = vec![e & 0x3FF];
+                    for k in 1..=5 {
+                        if !blocked(gx, gy - k) {
+                            break;
+                        }
+                        ids.push(entry(gx, gy - k).unwrap_or(0) & 0x3FF);
+                    }
+                    let period = |p: usize| {
+                        ids.len() > p && (0..ids.len() - p).all(|i| ids[i] == ids[i + p])
+                    };
+                    // (height, rows-above-in-column, total column rows):
+                    // the renderer folds the bottom `height` pixels of the
+                    // column's drawing onto the south wall and stretches
+                    // the remaining top rows over the top face as the roof.
+                    let above = ids.len() - 1;
+                    let mut below = 0usize;
+                    while below < 5 && blocked(gx, gy + below as i32 + 1) {
+                        below += 1;
+                    }
+                    let (h, t, r) = if period(1) {
+                        (16.0, 0u8, 1u8)
+                    } else if period(2) {
+                        (32.0, (above % 2) as u8, 2)
+                    } else if above + below == 0 {
+                        (10.0, 0, 1) // lone prop: mailbox, sign, fence piece
+                    } else {
+                        let total = (above + below + 1).min(6);
+                        ((total.min(2) * 16) as f32, above.min(5) as u8, total as u8)
+                    };
+                    cells.push(Cell::Block(h, t, r));
+                } else {
+                    let b = behavior(e);
+                    cells.push(match b {
+                        0x02 | 0x03 => Cell::Grass,
+                        0x10..=0x2F => Cell::Water,
+                        _ => Cell::Flat,
+                    });
+                }
+            }
+        }
+        Some(MapGrid {
+            fine: ((hofs % 16) as usize, (vofs % 16) as usize),
+            cells,
+        })
+    }
+}
+
 pub struct Renderer {
     pub buffer: Vec<u32>,
     zbuf: Vec<f32>,
     /// Per-map-pixel terrain height, from the metatile classifier.
     height: Vec<f32>,
     background: Vec<u32>,
+    /// Per-map-pixel color for terrain TOP faces: normally the drawn frame,
+    /// but block cells wear their column crown's art (roof rows) on top.
+    top_tex: Vec<u32>,
+    /// Tilt-shift level 0-3 from GBA_TILT (default 2; 0 = off).
+    tilt: u32,
 }
 
 impl Renderer {
@@ -83,7 +237,13 @@ impl Renderer {
             buffer: background.clone(),
             zbuf: vec![f32::INFINITY; WIDTH * HEIGHT],
             height: vec![0.0; ppu::WIDTH * ppu::HEIGHT],
+            top_tex: vec![0; ppu::WIDTH * ppu::HEIGHT],
             background,
+            tilt: std::env::var("GBA_TILT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2)
+                .min(3),
         }
     }
 
@@ -124,11 +284,6 @@ impl Renderer {
         }
     }
 
-    fn quad(&mut self, q: [(f32, f32, f32); 4], color: u32, dim: Option<f32>) {
-        self.tri([q[0], q[1], q[2]], color, dim);
-        self.tri([q[0], q[2], q[3]], color, dim);
-    }
-
     /// Z-buffered textured triangle: uv interpolated barycentrically,
     /// color from `sample(u, v)`.
     fn tri_uv(
@@ -136,6 +291,19 @@ impl Renderer {
         p: [(f32, f32, f32); 3],
         uv: [(f32, f32); 3],
         sample: &mut impl FnMut(f32, f32) -> u32,
+    ) {
+        self.tri_uv_mode(p, uv, sample, false)
+    }
+
+    /// `ghost`: inverted depth test, no depth write, dimmed color -- used to
+    /// repaint the player's silhouette where scenery hides it (the
+    /// reference mod's occlusion silhouette).
+    fn tri_uv_mode(
+        &mut self,
+        p: [(f32, f32, f32); 3],
+        uv: [(f32, f32); 3],
+        sample: &mut impl FnMut(f32, f32) -> u32,
+        ghost: bool,
     ) {
         let area = (p[1].0 - p[0].0) * (p[2].1 - p[0].1) - (p[1].1 - p[0].1) * (p[2].0 - p[0].0);
         if area.abs() < 1e-6 {
@@ -161,11 +329,22 @@ impl Renderer {
                 }
                 let z = w0 * p[0].2 + w1 * p[1].2 + w2 * p[2].2;
                 let i = y * WIDTH + x;
-                if z < self.zbuf[i] {
+                if (z < self.zbuf[i]) != ghost {
                     let u = w0 * uv[0].0 + w1 * uv[1].0 + w2 * uv[2].0;
                     let v = w0 * uv[0].1 + w1 * uv[1].1 + w2 * uv[2].1;
-                    self.zbuf[i] = z;
-                    self.buffer[i] = sample(u, v);
+                    let c = sample(u, v);
+                    if c != SKIP {
+                        if ghost {
+                            // Translucent silhouette: blend toward the scene.
+                            let mix = |s: u32, a: u32| {
+                                (((a >> s & 0xFF) * 2 + (self.buffer[i] >> s & 0xFF)) / 3) << s
+                            };
+                            self.buffer[i] = mix(16, c) | mix(8, c) | mix(0, c);
+                        } else {
+                            self.zbuf[i] = z;
+                            self.buffer[i] = c;
+                        }
+                    }
                 }
             }
         }
@@ -180,6 +359,15 @@ impl Renderer {
     ) {
         self.tri_uv([q[0], q[1], q[2]], [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)], sample);
         self.tri_uv([q[0], q[2], q[3]], [(0.0, 0.0), (1.0, 1.0), (0.0, 1.0)], sample);
+    }
+
+    fn quad_uv_ghost(
+        &mut self,
+        q: [(f32, f32, f32); 4],
+        sample: &mut impl FnMut(f32, f32) -> u32,
+    ) {
+        self.tri_uv_mode([q[0], q[1], q[2]], [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)], sample, true);
+        self.tri_uv_mode([q[0], q[2], q[3]], [(0.0, 0.0), (1.0, 1.0), (0.0, 1.0)], sample, true);
     }
 
     /// Flat textured row-strip: map pixels px0..px1 of row py at height h,
@@ -223,6 +411,45 @@ impl Renderer {
         }
     }
 
+    /// Terrain heights from the game's own map grid (preferred path):
+    /// walkable and tall-grass cells are flat ground, water recesses for a
+    /// shoreline lip, collision volumes take their measured height. The
+    /// screen-edge ramp keeps scenery growing out of the ground.
+    fn build_heights_from_grid(&mut self, grid: &MapGrid, cap: &Capture) {
+        for py in 0..ppu::HEIGHT {
+            let cy = ((py + grid.fine.1) / 16).min(MapGrid::ROWS - 1);
+            // Ramp only the top and side edges: the bottom (near) edge reads
+                // as the diorama's sheer cross-section cut.
+            let edge_y = py as f32;
+            for px in 0..ppu::WIDTH {
+                let cx = ((px + grid.fine.0) / 16).min(MapGrid::COLS - 1);
+                let i = py * ppu::WIDTH + px;
+                let (h, t, r) = match grid.cells[cy * MapGrid::COLS + cx] {
+                    Cell::Flat | Cell::Grass => (0.0, 0, 1),
+                    Cell::Water => (-3.0, 0, 1),
+                    Cell::Block(h, t, r) => (h, t as usize, r.max(1) as usize),
+                };
+                let edge = edge_y.min(px.min(ppu::WIDTH - 1 - px) as f32);
+                self.height[i] = h.min((edge + 1.0) * EDGE_RAMP);
+                // Fold: the bottom `h` pixels of the column's drawing are on
+                // the south wall; the top face wears what remains (the roof
+                // rows), stretched over the whole footprint. Fully folded
+                // columns (trees) wear their top row.
+                let src = if h <= 0.0 {
+                    py
+                } else {
+                    // Screen y of the column's top edge.
+                    let in_cell = (py + grid.fine.1) % 16;
+                    let coltop = py as i32 - (t * 16 + in_cell) as i32;
+                    let roof = ((r * 16) as f32 - h).max(16.0);
+                    let d = (py as i32 - coltop) as f32 * roof / (r * 16) as f32;
+                    (coltop + d as i32).clamp(0, ppu::HEIGHT as i32 - 1) as usize
+                };
+                self.top_tex[i] = cap.bg_frame[src * ppu::WIDTH + px];
+            }
+        }
+    }
+
     /// Terrain height per map pixel. Classified per 16x16 metatile aligned
     /// to the BG scroll (FireRed's map blocks are 16x16): BG1 overlay tiles
     /// (houses, roofs, tree canopies) extrude tall, BG3 prop tiles split by
@@ -232,6 +459,7 @@ impl Renderer {
     /// down near the frame edges so scenery scrolling in grows out of the
     /// ground instead of popping in as a bare side wall.
     fn build_heights(&mut self, cap: &Capture) {
+        self.top_tex.copy_from_slice(&cap.bg_frame);
         let (hofs, vofs) = cap.scroll;
         let (ox, oy) = (-((hofs % 16) as i32), -((vofs % 16) as i32));
         let (tw, th) = (ppu::WIDTH.div_ceil(16) + 1, ppu::HEIGHT.div_ceil(16) + 1);
@@ -277,7 +505,9 @@ impl Renderer {
         }
         for py in 0..ppu::HEIGHT {
             let ty = ((py as i32 - oy) / 16) as usize;
-            let edge_y = py.min(ppu::HEIGHT - 1 - py) as f32;
+            // Ramp only the top and side edges: the bottom (near) edge reads
+                // as the diorama's sheer cross-section cut.
+            let edge_y = py as f32;
             for px in 0..ppu::WIDTH {
                 let tx = ((px as i32 - ox) / 16) as usize;
                 let edge = edge_y.min(px.min(ppu::WIDTH - 1 - px) as f32);
@@ -310,7 +540,7 @@ impl Renderer {
     /// Draw one diorama frame from the captured layers. `flat` is the PPU's
     /// real 2D framebuffer, used verbatim when the scene is not a mode-0
     /// overworld (intro, battles) or when UI covers most of the picture.
-    pub fn render(&mut self, cap: &Capture, flat: &[u32]) {
+    pub fn render(&mut self, cap: &Capture, flat: &[u32], grid: Option<&MapGrid>) {
         self.buffer.copy_from_slice(&self.background);
         self.zbuf.fill(f32::INFINITY);
         if cap.bg_frame.len() < ppu::WIDTH * ppu::HEIGHT {
@@ -321,12 +551,15 @@ impl Renderer {
             self.blit_2d(flat, false);
             return;
         }
-        self.build_heights(cap);
+        match grid {
+            Some(g) => self.build_heights_from_grid(g, cap),
+            None => self.build_heights(cap),
+        }
 
         // Terrain: textured strips over constant-height runs, then walls at
         // height discontinuities.
         for py in 0..ppu::HEIGHT {
-            let row = &cap.bg_frame[py * ppu::WIDTH..(py + 1) * ppu::WIDTH];
+
             let hrow = py * ppu::WIDTH;
             let mut px0 = 0;
             while px0 < ppu::WIDTH {
@@ -335,15 +568,19 @@ impl Renderer {
                 while px1 < ppu::WIDTH && self.height[hrow + px1] == h {
                     px1 += 1;
                 }
-                // Split borrows: strip reads `row` (from cap), writes self.
-                let row_vec: &[u32] = row;
-                self.strip(px0, px1, py, h, row_vec);
+                // Split borrows: take the top texture out while strips run.
+                let tex = std::mem::take(&mut self.top_tex);
+                self.strip(px0, px1, py, h, &tex[py * ppu::WIDTH..(py + 1) * ppu::WIDTH]);
+                self.top_tex = tex;
                 px0 = px1;
             }
         }
         self.render_walls(cap);
 
         self.render_sprites_entry(cap);
+        if self.tilt > 0 {
+            self.tilt_shift(self.tilt);
+        }
         // Dialogue boxes and menus (BG0) composite flat in screen space on
         // top of the finished 3D scene — UI must never extrude.
         if ui_pixels > 0 {
@@ -358,6 +595,9 @@ impl Renderer {
     /// This is what keeps a 16-unit tree face looking like tree art instead
     /// of a single pixel row smeared into vertical stripes.
     fn render_walls(&mut self, cap: &Capture) {
+        if std::env::var("GBA_NO_WALLS").is_ok() {
+            return;
+        }
         const W: usize = ppu::WIDTH;
         const H: usize = ppu::HEIGHT;
         // Take the heightfield out of self so the raster methods can borrow
@@ -369,15 +609,18 @@ impl Renderer {
             let mut px0 = 0;
             while px0 < W {
                 let h = hgt(px0, py);
-                let hs = if py + 1 < H { hgt(px0, py + 1) } else { h };
-                if !(h > 0.0 && hs < h) {
+                // Below the screen's bottom row lies the diorama's cut
+                // plane: draw the face so cut buildings show a cross
+                // section instead of a floating slab.
+                let hs = if py + 1 < H { hgt(px0, py + 1) } else { 0.0 };
+                if hs >= h {
                     px0 += 1;
                     continue;
                 }
                 let mut px1 = px0 + 1;
                 while px1 < W
                     && hgt(px1, py) == h
-                    && (if py + 1 < H { hgt(px1, py + 1) } else { h }) == hs
+                    && (if py + 1 < H { hgt(px1, py + 1) } else { 0.0 }) == hs
                 {
                     px1 += 1;
                 }
@@ -392,7 +635,9 @@ impl Renderer {
                 let (n, dh) = ((px1 - px0) as f32, h - hs);
                 self.quad_uv(q, &mut |u: f32, v: f32| {
                     let col = px0 + ((u * n) as usize).min(px1 - px0 - 1);
-                    let row = py.saturating_sub((v.max(0.0) * dh) as usize);
+                    // Fold the art upright: the drawing's bottom row lands
+                    // at the wall's bottom, not mirrored.
+                    let row = py.saturating_sub(((1.0 - v.clamp(0.0, 1.0)) * (dh - 1.0)) as usize);
                     shade(cap.bg_frame[row * W + col], 0.55)
                 });
                 px0 = px1;
@@ -409,7 +654,7 @@ impl Renderer {
                         false if px + 1 < W => hgt(px + 1, py0),
                         _ => h,
                     };
-                    if !(h > 0.0 && hn < h) {
+                    if hn >= h {
                         py0 += 1;
                         continue;
                     }
@@ -518,68 +763,114 @@ impl Renderer {
                 self.tri([project(cxw, cyw, czw), pt(a0), pt(a1)], 0, Some(0.55));
             }
 
-            // Voxel billboard: each sprite pixel is a 1x1 face standing
-            // upright at the feet line; thin top/side faces give it depth.
-            // Rows are stretched by 1/cos(pitch) so the sprite art projects
-            // 1:1 on screen instead of foreshortening into a slab.
-            let vscale = 1.0 / COS_P;
-            let thick = 1.4;
-            for &i in &pixels {
-                let (x, y) = ((i % W) as f32, (i / W) as f32);
-                let color = grid[i] & 0x00FF_FFFF;
-                let h0 = ground + (feet - y - 1.0) * vscale;
-                let h1 = h0 + vscale;
-                let (wx, _, wz) = world(x, feet - 1.0, 0.0);
-                // Front face.
-                self.quad(
-                    [
-                        project(wx, h1, wz),
-                        project(wx + 1.0, h1, wz),
-                        project(wx + 1.0, h0, wz),
-                        project(wx, h0, wz),
-                    ],
-                    color,
-                    None,
-                );
-                // Top face where no sprite pixel sits above.
-                if y as usize == 0 || grid[i - W] == 0 {
-                    self.quad(
-                        [
-                            project(wx, h1, wz + thick),
-                            project(wx + 1.0, h1, wz + thick),
-                            project(wx + 1.0, h1, wz),
-                            project(wx, h1, wz),
-                        ],
-                        shade(color, 1.18),
-                        None,
-                    );
+            // The figure itself: ONE flat alpha-cut quad wearing the sprite
+            // frame, standing at its feet and leaning back by exactly the
+            // camera pitch (feet pivot), so it reads face-on like the flat
+            // game. A sprite is a drawing, not an object seen from one
+            // side; no geometry is built from its pixels.
+            let top = pixels.iter().map(|i| i / W).min().unwrap() as f32;
+            let hart = feet - top;
+            // Lean-back unit vector: up tilted north by the pitch angle.
+            let (uy, uz) = (COS_P, SIN_P);
+            let (wx0, _, wz0) = world(min_x, feet, 0.0);
+            let wx1 = wx0 + (max_x - min_x);
+            let q = [
+                project(wx0, ground + hart * uy, wz0 + hart * uz),
+                project(wx1, ground + hart * uy, wz0 + hart * uz),
+                project(wx1, ground, wz0),
+                project(wx0, ground, wz0),
+            ];
+            let (bw, bh) = (max_x - min_x, hart);
+            let mut sampler = |u: f32, v: f32| {
+                let sx = (min_x + (u * bw).min(bw - 0.5)) as usize;
+                let sy = (top + (v * bh).min(bh - 0.5)) as usize;
+                let c = grid[sy.min(ppu::HEIGHT - 1) * W + sx.min(W - 1)];
+                if c == 0 { SKIP } else { c & 0x00FF_FFFF }
+            };
+            self.quad_uv(q, &mut sampler);
+            // Repaint the figure closest to screen center (the player) as a
+            // translucent silhouette wherever scenery hides it, so walking
+            // behind a house or tree never loses the character.
+            let center_dist =
+                (ccx - ppu::WIDTH as f32 / 2.0).abs() + (feet - ppu::HEIGHT as f32 / 2.0).abs();
+            if center_dist < 40.0 {
+                self.quad_uv_ghost(q, &mut sampler);
+            }
+        }
+    }
+}
+
+/// Sentinel a `tri_uv` sampler returns for transparent texels: the pixel is
+/// skipped entirely (no color, no depth), cutting the silhouette out of the
+/// quad.
+const SKIP: u32 = 0xFFFF_FFFF;
+
+impl Renderer {
+    /// Tilt-shift post-process, the miniature-diorama look: a horizontal
+    /// band through the focus line stays sharp and the frame blurs toward
+    /// the top and bottom edges (two separable gaussian passes), with a
+    /// slight saturation lift. Runs on the finished 3D scene BEFORE the UI
+    /// composites over it. `level` 1-3, from GBA_TILT (default 2).
+    fn tilt_shift(&mut self, level: u32) {
+        // (tap spacing as fraction of height, sharp half-band, blur ramp,
+        // saturation), matching the reference presets.
+        let presets = [
+            (0.0016, 0.14, 0.42, 1.10),
+            (0.0028, 0.10, 0.36, 1.18),
+            (0.0042, 0.07, 0.30, 1.28),
+        ];
+        let (spacing, band, range, sat) = presets[(level as usize - 1).min(2)];
+        let spacing = (HEIGHT as f32 * spacing).clamp(0.75, 3.0);
+        const WTS: [i32; 5] = [930, 797, 498, 221, 66]; // gaussian * 4096
+        let strength = |y: usize| {
+            let d = (y as f32 / HEIGHT as f32 - 0.5).abs() - band;
+            let s = (d / range).clamp(0.0, 1.0);
+            s * s * spacing
+        };
+        let blur = |src: &[u32], dst: &mut [u32], horizontal: bool| {
+            for y in 0..HEIGHT {
+                let o = strength(y);
+                let row = y * WIDTH;
+                if o < 0.05 {
+                    dst[row..row + WIDTH].copy_from_slice(&src[row..row + WIDTH]);
+                    continue;
                 }
-                // Side faces at the figure's silhouette edges.
-                if x as usize == 0 || grid[i - 1] == 0 {
-                    self.quad(
-                        [
-                            project(wx, h1, wz + thick),
-                            project(wx, h1, wz),
-                            project(wx, h0, wz),
-                            project(wx, h0, wz + thick),
-                        ],
-                        shade(color, 0.6),
-                        None,
-                    );
-                }
-                if x as usize + 1 >= W || grid[i + 1] == 0 {
-                    self.quad(
-                        [
-                            project(wx + 1.0, h1, wz),
-                            project(wx + 1.0, h1, wz + thick),
-                            project(wx + 1.0, h0, wz + thick),
-                            project(wx + 1.0, h0, wz),
-                        ],
-                        shade(color, 0.6),
-                        None,
-                    );
+                for x in 0..WIDTH {
+                    let (mut r, mut g, mut b, mut wsum) = (0i32, 0i32, 0i32, 0i32);
+                    for (k, &w) in WTS.iter().enumerate() {
+                        for sgn in [-1i32, 1] {
+                            if k == 0 && sgn == 1 {
+                                continue;
+                            }
+                            let off = (k as f32 * o) as i32 * sgn;
+                            let (sx, sy) = if horizontal {
+                                ((x as i32 + off).clamp(0, WIDTH as i32 - 1), y as i32)
+                            } else {
+                                (x as i32, (y as i32 + off).clamp(0, HEIGHT as i32 - 1))
+                            };
+                            let c = src[sy as usize * WIDTH + sx as usize];
+                            r += (c >> 16 & 0xFF) as i32 * w;
+                            g += (c >> 8 & 0xFF) as i32 * w;
+                            b += (c & 0xFF) as i32 * w;
+                            wsum += w;
+                        }
+                    }
+                    dst[row + x] =
+                        ((r / wsum) as u32) << 16 | ((g / wsum) as u32) << 8 | (b / wsum) as u32;
                 }
             }
+        };
+        let mut tmp = vec![0u32; WIDTH * HEIGHT];
+        let src = std::mem::take(&mut self.buffer);
+        blur(&src, &mut tmp, true);
+        self.buffer = src;
+        blur(&tmp, &mut self.buffer, false);
+        // Saturation lift over the whole frame sells the model-photo feel.
+        for c in self.buffer.iter_mut() {
+            let (r, g, b) = ((*c >> 16 & 0xFF) as f32, (*c >> 8 & 0xFF) as f32, (*c & 0xFF) as f32);
+            let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+            let mix = |ch: f32| (luma + (ch - luma) * sat).clamp(0.0, 255.0) as u32;
+            *c = mix(r) << 16 | mix(g) << 8 | mix(b);
         }
     }
 }
