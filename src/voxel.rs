@@ -337,7 +337,7 @@ impl Renderer {
                         if ghost {
                             // Translucent silhouette: blend toward the scene.
                             let mix = |s: u32, a: u32| {
-                                (((a >> s & 0xFF) * 2 + (self.buffer[i] >> s & 0xFF)) / 3) << s
+                                (((a >> s & 0xFF) + (self.buffer[i] >> s & 0xFF) * 2) / 3) << s
                             };
                             self.buffer[i] = mix(16, c) | mix(8, c) | mix(0, c);
                         } else {
@@ -577,7 +577,7 @@ impl Renderer {
         }
         self.render_walls(cap);
 
-        self.render_sprites_entry(cap);
+        self.render_sprites_entry(cap, grid);
         if self.tilt > 0 {
             self.tilt_shift(self.tilt);
         }
@@ -692,17 +692,17 @@ impl Renderer {
         self.height = height;
     }
 
-    fn render_sprites_entry(&mut self, cap: &Capture) {
+    fn render_sprites_entry(&mut self, cap: &Capture, grid: Option<&MapGrid>) {
         if std::env::var("GBA_SPR_DEBUG").is_ok() {
             eprintln!("sprite pixels: {}", cap.sprite_pixels.len());
         }
-        self.render_sprites(cap);
+        self.render_sprites(cap, grid);
     }
 
     /// Sprites: group captured sprite pixels into connected figures, then
     /// draw each as a vertical billboard of voxels standing at its feet row,
     /// with a soft contact shadow on the ground.
-    fn render_sprites(&mut self, cap: &Capture) {
+    fn render_sprites(&mut self, cap: &Capture, mgrid: Option<&MapGrid>) {
         const W: usize = ppu::WIDTH;
         // Grid of sprite pixels for clustering.
         let mut grid: Vec<u32> = vec![0; W * ppu::HEIGHT];
@@ -740,8 +740,28 @@ impl Renderer {
             let feet = pixels.iter().map(|i| i / W).max().unwrap() as f32 + 1.0;
             let min_x = pixels.iter().map(|i| i % W).min().unwrap() as f32;
             let max_x = pixels.iter().map(|i| i % W).max().unwrap() as f32 + 1.0;
-            let ground = self.height[(feet as usize - 1).min(ppu::HEIGHT - 1) * W
-                + ((min_x + max_x) as usize / 2).min(W - 1)];
+            // Anchor at the feet cell's GROUND elevation, never on top of
+            // a blocked volume: a sprite overlapping a building on screen
+            // stands on the ground BEHIND it (north of it) in world space,
+            // and the depth buffer occludes it naturally (the silhouette
+            // pass shows the player through).
+            let (fy, fx) = (
+                (feet as usize - 1).min(ppu::HEIGHT - 1),
+                ((min_x + max_x) as usize / 2).min(W - 1),
+            );
+            let ground = match mgrid {
+                Some(g) => {
+                    let cx = ((fx + g.fine.0) / 16).min(MapGrid::COLS - 1);
+                    let cy = ((fy + g.fine.1) / 16).min(MapGrid::ROWS - 1);
+                    match g.cells[cy * MapGrid::COLS + cx] {
+                        Cell::Water => -3.0,
+                        _ => 0.0,
+                    }
+                }
+                // Fallback classifier: stay on the ground unless the feet
+                // cell is genuinely low relief.
+                None => self.height[fy * W + fx].min(H_GRASS),
+            };
 
             // Contact shadow first (drawn onto the ground, no z write).
             let (ccx, cw) = ((min_x + max_x) / 2.0, (max_x - min_x) / 2.0);
