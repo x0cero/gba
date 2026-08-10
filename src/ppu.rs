@@ -568,6 +568,8 @@ pub struct Capture {
     /// (the "ground under the overlay"); equals bg_frame where only one
     /// layer is opaque. Used to paint terrain under raised scenery.
     pub bg_under: Vec<u32>,
+    /// BG2 (ground layer) scroll registers, for metatile grid alignment.
+    pub scroll: (u16, u16),
 }
 
 impl Capture {
@@ -584,6 +586,7 @@ impl Capture {
         self.bg_under.clear();
         self.bg_under.resize(WIDTH * HEIGHT, rgb555(backdrop555));
         self.sprite_pixels.clear();
+        self.scroll = (r16(0x18) & 0x1FF, r16(0x1A) & 0x1FF);
         if dispcnt & 0x80 != 0 {
             return; // forced blank
         }

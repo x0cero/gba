@@ -4,15 +4,18 @@
 //! style of the Gen1Recomp voxel mod: the ground is a real 3D heightfield
 //! (scenery layers extrude upward as blocks with shaded side walls), and
 //! sprites stand up as thin vertical voxel figures anchored by a soft
-//! contact shadow. Everything is software-rasterized (z-buffered triangles),
-//! no dependencies.
+//! contact shadow. Everything is software-rasterized (z-buffered), no
+//! dependencies. Terrain tops are drawn as textured trapezoid row-strips
+//! (exact for this camera: depth is constant along a screen scanline of a
+//! flat strip), which keeps a busy forest scene around ~2ms.
 use gba::ppu::{self, Capture};
 
 pub const WIDTH: usize = 800;
 pub const HEIGHT: usize = 500;
 
-/// Camera pitch down from horizontal, in degrees.
-const PITCH_DEG: f32 = 52.0;
+/// Camera pitch down from horizontal: 52 degrees.
+const SIN_P: f32 = 0.788_010_7;
+const COS_P: f32 = 0.615_661_5;
 /// Camera distance from the diorama center (world units = GBA pixels).
 const CAM_DIST: f32 = 340.0;
 /// Focal length in screen pixels.
@@ -22,7 +25,12 @@ const CY: f32 = 236.0;
 
 /// Extrusion heights per scenery class, in world units.
 const H_OVERLAY: f32 = 16.0; // BG1: house bodies, roofs, tree canopies
-const H_PROP: f32 = 9.0; // BG3: trunks, signs, mailboxes, fences
+const H_PROP: f32 = 9.0; // BG3: fences, signs, mailboxes
+const H_GRASS: f32 = 3.0; // BG3 tiles that are dominantly green: tall grass
+/// Terrain height is clamped to 2 units per map pixel of distance from the
+/// frame edge, so scenery scrolling in grows out of the ground instead of
+/// popping in as a bare wall slab.
+const EDGE_RAMP: f32 = 2.0;
 const BACKGROUND_TOP: u32 = 0x0016203A;
 const BACKGROUND_BOT: u32 = 0x00060A14;
 
@@ -36,9 +44,8 @@ fn shade(color: u32, f: f32) -> u32 {
 /// to (screen x, screen y, view depth).
 #[inline]
 fn project(wx: f32, wy: f32, wz: f32) -> (f32, f32, f32) {
-    let (s, c) = PITCH_DEG.to_radians().sin_cos();
-    let yv = wy * c + wz * s;
-    let zv = CAM_DIST + wz * c - wy * s;
+    let yv = wy * COS_P + wz * SIN_P;
+    let zv = CAM_DIST + wz * COS_P - wy * SIN_P;
     (CX + FOCAL * wx / zv, CY - FOCAL * yv / zv, zv)
 }
 
@@ -52,16 +59,31 @@ fn world(px: f32, py: f32, h: f32) -> (f32, f32, f32) {
 pub struct Renderer {
     pub buffer: Vec<u32>,
     zbuf: Vec<f32>,
-    /// Per-map-pixel terrain height, quantized per 8x8 tile.
+    /// Per-map-pixel terrain height, from the metatile classifier.
     height: Vec<f32>,
+    background: Vec<u32>,
 }
 
 impl Renderer {
     pub fn new() -> Self {
+        // Background: subtle vertical gradient, precomputed once.
+        let mut background = vec![0u32; WIDTH * HEIGHT];
+        for y in 0..HEIGHT {
+            let t = y as f32 / HEIGHT as f32;
+            let lerp = |a: u32, b: u32, s: u32| {
+                let (a, b) = (a >> s & 0xFF, b >> s & 0xFF);
+                ((a as f32 + (b as f32 - a as f32) * t) as u32) << s
+            };
+            let c = lerp(BACKGROUND_TOP, BACKGROUND_BOT, 16)
+                | lerp(BACKGROUND_TOP, BACKGROUND_BOT, 8)
+                | lerp(BACKGROUND_TOP, BACKGROUND_BOT, 0);
+            background[y * WIDTH..(y + 1) * WIDTH].fill(c);
+        }
         Self {
-            buffer: vec![0; WIDTH * HEIGHT],
+            buffer: background.clone(),
             zbuf: vec![f32::INFINITY; WIDTH * HEIGHT],
             height: vec![0.0; ppu::WIDTH * ppu::HEIGHT],
+            background,
         }
     }
 
@@ -107,17 +129,45 @@ impl Renderer {
         self.tri([q[0], q[2], q[3]], color, dim);
     }
 
-    /// Axis-aligned horizontal cell top: map rect (px..px+1, py..py+1) at
-    /// height h.
-    fn top_face(&mut self, px: f32, py: f32, h: f32, color: u32) {
-        let (ax, ay, az) = world(px, py, h);
-        let q = [
-            project(ax, ay, az),
-            project(ax + 1.0, ay, az),
-            project(ax + 1.0, ay, az - 1.0),
-            project(ax, ay, az - 1.0),
-        ];
-        self.quad(q, color, None);
+    /// Flat textured row-strip: map pixels px0..px1 of row py at height h,
+    /// colored from `row`. Depth is constant along each screen scanline of
+    /// the strip, so linear interpolation is exact for this camera.
+    fn strip(&mut self, px0: usize, px1: usize, py: usize, h: f32, row: &[u32]) {
+        let (xtl, yt, zt) = {
+            let (wx, wy, wz) = world(px0 as f32, py as f32, h);
+            project(wx, wy, wz)
+        };
+        let (xtr, _, _) = {
+            let (wx, wy, wz) = world(px1 as f32, py as f32, h);
+            project(wx, wy, wz)
+        };
+        let (xbl, yb, zb) = {
+            let (wx, wy, wz) = world(px0 as f32, py as f32 + 1.0, h);
+            project(wx, wy, wz)
+        };
+        let (xbr, _, _) = {
+            let (wx, wy, wz) = world(px1 as f32, py as f32 + 1.0, h);
+            project(wx, wy, wz)
+        };
+        let (sy0, sy1) = ((yt - 0.5).ceil() as i32, (yb - 0.5).ceil() as i32);
+        let n = px1 - px0;
+        for sy in sy0.max(0)..sy1.min(HEIGHT as i32) {
+            let t = (sy as f32 + 0.5 - yt) / (yb - yt);
+            let xl = xtl + (xbl - xtl) * t;
+            let xr = xtr + (xbr - xtr) * t;
+            let z = zt + (zb - zt) * t;
+            let (sx0, sx1) = ((xl - 0.5).ceil() as i32, (xr - 0.5).ceil() as i32);
+            let du = n as f32 / (xr - xl);
+            let base = sy as usize * WIDTH;
+            for sx in sx0.max(0)..sx1.min(WIDTH as i32) {
+                let i = base + sx as usize;
+                if z < self.zbuf[i] {
+                    let u = ((sx as f32 + 0.5 - xl) * du) as usize;
+                    self.zbuf[i] = z;
+                    self.buffer[i] = row[px0 + u.min(n - 1)];
+                }
+            }
+        }
     }
 
     /// Vertical wall along a cell edge from height h0 up to h1. `axis` 0 =
@@ -134,111 +184,122 @@ impl Renderer {
         self.quad(q, color, None);
     }
 
-    /// Terrain height per map pixel: scenery layers extrude, quantized per
-    /// 8x8 tile (majority class) so blocks read as deliberate architecture.
+    /// Terrain height per map pixel. Classified per 16x16 metatile aligned
+    /// to the BG scroll (FireRed's map blocks are 16x16): BG1 overlay tiles
+    /// (houses, roofs, tree canopies) extrude tall, BG3 prop tiles split by
+    /// color into low tall-grass (dominantly green) and fences/signs; brown
+    /// prop tiles directly south of a tall tile merge into it (tree trunks
+    /// under canopies), so trees read as single solid blocks. Heights ramp
+    /// down near the frame edges so scenery scrolling in grows out of the
+    /// ground instead of popping in as a bare side wall.
     fn build_heights(&mut self, cap: &Capture) {
-        let class = |i: usize| match cap.bg_layer[i] {
-            1 => H_OVERLAY,
-            3 => H_PROP,
-            _ => 0.0,
-        };
-        for ty in 0..ppu::HEIGHT / 8 {
-            for tx in 0..ppu::WIDTH / 8 {
-                let (mut n_over, mut n_prop) = (0, 0);
-                for dy in 0..8 {
-                    for dx in 0..8 {
-                        match class((ty * 8 + dy) * ppu::WIDTH + tx * 8 + dx) {
-                            h if h == H_OVERLAY => n_over += 1,
-                            h if h == H_PROP => n_prop += 1,
+        let (hofs, vofs) = cap.scroll;
+        let (ox, oy) = (-((hofs % 16) as i32), -((vofs % 16) as i32));
+        let (tw, th) = (ppu::WIDTH.div_ceil(16) + 1, ppu::HEIGHT.div_ceil(16) + 1);
+        let mut tiles = vec![0.0f32; tw * th];
+        let mut green = vec![false; tw * th];
+        for ty in 0..th {
+            for tx in 0..tw {
+                let (x0, y0) = (ox + tx as i32 * 16, oy + ty as i32 * 16);
+                let (mut n_over, mut n_prop) = (0u32, 0u32);
+                let (mut rs, mut gs) = (0u32, 0u32);
+                for y in y0.max(0)..(y0 + 16).min(ppu::HEIGHT as i32) {
+                    for x in x0.max(0)..(x0 + 16).min(ppu::WIDTH as i32) {
+                        let i = y as usize * ppu::WIDTH + x as usize;
+                        match cap.bg_layer[i] {
+                            1 => n_over += 1,
+                            3 => {
+                                n_prop += 1;
+                                rs += cap.bg_frame[i] >> 16 & 0xFF;
+                                gs += cap.bg_frame[i] >> 8 & 0xFF;
+                            }
                             _ => {}
                         }
                     }
                 }
-                let h = if n_over >= 24 {
-                    H_OVERLAY
-                } else if n_over + n_prop >= 24 {
-                    H_PROP
-                } else {
-                    0.0
-                };
-                for dy in 0..8 {
-                    for dx in 0..8 {
-                        self.height[(ty * 8 + dy) * ppu::WIDTH + tx * 8 + dx] = h;
-                    }
+                let ti = ty * tw + tx;
+                if n_over >= 40 && n_over >= n_prop {
+                    tiles[ti] = H_OVERLAY;
+                } else if n_prop >= 40 {
+                    green[ti] = gs > rs + rs / 4;
+                    tiles[ti] = if green[ti] { H_GRASS } else { H_PROP };
                 }
+            }
+        }
+        // Merge pass: fence/sign-height tiles under a tall tile are tree
+        // trunks; raise them so each tree is one solid block.
+        for ty in 1..th {
+            for tx in 0..tw {
+                let ti = ty * tw + tx;
+                if tiles[ti] == H_PROP && !green[ti] && tiles[ti - tw] == H_OVERLAY {
+                    tiles[ti] = H_OVERLAY;
+                }
+            }
+        }
+        for py in 0..ppu::HEIGHT {
+            let ty = ((py as i32 - oy) / 16) as usize;
+            let edge_y = py.min(ppu::HEIGHT - 1 - py) as f32;
+            for px in 0..ppu::WIDTH {
+                let tx = ((px as i32 - ox) / 16) as usize;
+                let edge = edge_y.min(px.min(ppu::WIDTH - 1 - px) as f32);
+                self.height[py * ppu::WIDTH + px] =
+                    tiles[ty * tw + tx].min((edge + 1.0) * EDGE_RAMP);
             }
         }
     }
 
     /// Draw one diorama frame from the captured layers.
     pub fn render(&mut self, cap: &Capture) {
-        // Background: subtle vertical gradient.
-        for y in 0..HEIGHT {
-            let t = y as f32 / HEIGHT as f32;
-            let lerp = |a: u32, b: u32, s: u32| {
-                let (a, b) = (a >> s & 0xFF, b >> s & 0xFF);
-                ((a as f32 + (b as f32 - a as f32) * t) as u32) << s
-            };
-            let c = lerp(BACKGROUND_TOP, BACKGROUND_BOT, 16)
-                | lerp(BACKGROUND_TOP, BACKGROUND_BOT, 8)
-                | lerp(BACKGROUND_TOP, BACKGROUND_BOT, 0);
-            self.buffer[y * WIDTH..(y + 1) * WIDTH].fill(c);
-        }
+        self.buffer.copy_from_slice(&self.background);
         self.zbuf.fill(f32::INFINITY);
         if cap.bg_frame.len() < ppu::WIDTH * ppu::HEIGHT {
             return; // no capture yet (first frame)
         }
         self.build_heights(cap);
 
-        // Terrain: top faces everywhere, walls at height discontinuities.
-        let no_terrain = std::env::var("GBA_NO_TERRAIN").is_ok();
+        // Terrain: textured strips over constant-height runs, then walls at
+        // height discontinuities.
         for py in 0..ppu::HEIGHT {
-            if no_terrain {
-                break;
+            let row = &cap.bg_frame[py * ppu::WIDTH..(py + 1) * ppu::WIDTH];
+            let hrow = py * ppu::WIDTH;
+            let mut px0 = 0;
+            while px0 < ppu::WIDTH {
+                let h = self.height[hrow + px0];
+                let mut px1 = px0 + 1;
+                while px1 < ppu::WIDTH && self.height[hrow + px1] == h {
+                    px1 += 1;
+                }
+                // Split borrows: strip reads `row` (from cap), writes self.
+                let row_vec: &[u32] = row;
+                self.strip(px0, px1, py, h, row_vec);
+                px0 = px1;
             }
             for px in 0..ppu::WIDTH {
-                let i = py * ppu::WIDTH + px;
+                let i = hrow + px;
                 let h = self.height[i];
-                let color = cap.bg_frame[i];
-                self.top_face(px as f32, py as f32, h, color);
                 if h <= 0.0 {
                     continue;
                 }
-                let wall_c = shade(color, 0.55);
-                let side_c = shade(color, 0.42);
+                let color = cap.bg_frame[i];
                 // South wall (faces the camera).
-                let hs = if py + 1 < ppu::HEIGHT { self.height[i + ppu::WIDTH] } else { 0.0 };
+                let hs = if py + 1 < ppu::HEIGHT { self.height[i + ppu::WIDTH] } else { h };
                 if hs < h {
-                    self.wall(px as f32, py as f32 + 1.0, 0, hs, h, wall_c);
+                    self.wall(px as f32, py as f32 + 1.0, 0, hs, h, shade(color, 0.55));
                 }
                 // West / east walls.
-                let hw = if px > 0 { self.height[i - 1] } else { 0.0 };
+                let hw = if px > 0 { self.height[i - 1] } else { h };
                 if hw < h {
-                    self.wall(px as f32, py as f32, 1, hw, h, side_c);
+                    self.wall(px as f32, py as f32, 1, hw, h, shade(color, 0.42));
                 }
-                let he = if px + 1 < ppu::WIDTH { self.height[i + 1] } else { 0.0 };
+                let he = if px + 1 < ppu::WIDTH { self.height[i + 1] } else { h };
                 if he < h {
-                    self.wall(px as f32 + 1.0, py as f32, 1, he, h, side_c);
+                    self.wall(px as f32 + 1.0, py as f32, 1, he, h, shade(color, 0.42));
                 }
             }
         }
 
         if std::env::var("GBA_SPR_DEBUG").is_ok() {
-            let (mut minx, mut maxx, mut miny, mut maxy) = (255u8, 0u8, 255u8, 0u8);
-            for &(x, y, _) in &cap.sprite_pixels {
-                minx = minx.min(x);
-                maxx = maxx.max(x);
-                miny = miny.min(y);
-                maxy = maxy.max(y);
-            }
-            eprintln!(
-                "sprite pixels: {} bbox x {}-{} y {}-{}",
-                cap.sprite_pixels.len(),
-                minx,
-                maxx,
-                miny,
-                maxy
-            );
+            eprintln!("sprite pixels: {}", cap.sprite_pixels.len());
         }
         self.render_sprites(cap);
     }
@@ -284,17 +345,6 @@ impl Renderer {
             let feet = pixels.iter().map(|i| i / W).max().unwrap() as f32 + 1.0;
             let min_x = pixels.iter().map(|i| i % W).min().unwrap() as f32;
             let max_x = pixels.iter().map(|i| i % W).max().unwrap() as f32 + 1.0;
-            if std::env::var("GBA_SPR_DEBUG").is_ok() {
-                let top = pixels.iter().map(|i| i / W).min().unwrap();
-                eprintln!(
-                    "cluster: {} px, x {}-{}, y {}-{}",
-                    pixels.len(),
-                    min_x,
-                    max_x,
-                    top,
-                    feet
-                );
-            }
             let ground = self.height[(feet as usize - 1).min(ppu::HEIGHT - 1) * W
                 + ((min_x + max_x) as usize / 2).min(W - 1)];
 
@@ -320,9 +370,9 @@ impl Renderer {
 
             // Voxel billboard: each sprite pixel is a 1x1 face standing
             // upright at the feet line; thin top/side faces give it depth.
-            // Billboard rows are stretched by 1/cos(pitch) so the sprite art
-            // projects 1:1 on screen instead of foreshortening into a slab.
-            let vscale = 1.0 / PITCH_DEG.to_radians().cos();
+            // Rows are stretched by 1/cos(pitch) so the sprite art projects
+            // 1:1 on screen instead of foreshortening into a slab.
+            let vscale = 1.0 / COS_P;
             let thick = 1.4;
             for &i in &pixels {
                 let (x, y) = ((i % W) as f32, (i / W) as f32);

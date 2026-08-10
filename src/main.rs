@@ -56,14 +56,10 @@ fn main() -> ExitCode {
         }
     }
 
-    if headless {
-        // Run N frames, dump the last one as PPM. GBA_INPUT holds scripted
-        // key presses: "first-last:key,..." (frame ranges, inclusive start).
-        let frames: u32 = env::var("GBA_FRAMES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(300);
-        let script: Vec<(u32, u32, u16)> = env::var("GBA_INPUT")
+    /// GBA_INPUT scripted key presses: "first-last:key,..." (frame ranges,
+    /// inclusive start).
+    fn parse_input_script() -> Vec<(u32, u32, u16)> {
+        env::var("GBA_INPUT")
             .unwrap_or_default()
             .split(',')
             .filter_map(|part| {
@@ -84,7 +80,16 @@ fn main() -> ExitCode {
                 };
                 Some((a.parse().ok()?, b.parse().ok()?, 1u16 << bit))
             })
-            .collect();
+            .collect()
+    }
+
+    if headless {
+        // Run N frames, dump the last one as PPM.
+        let frames: u32 = env::var("GBA_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+        let script = parse_input_script();
         let mut n = 0;
         let dump_every: Option<u32> = env::var("GBA_DUMP_EVERY").ok().and_then(|v| v.parse().ok());
         let dump_dir = env::var("GBA_DUMP_DIR").unwrap_or_else(|_| "filmstrip".into());
@@ -181,9 +186,13 @@ fn main() -> ExitCode {
                     let t = std::time::Instant::now();
                     for _ in 0..100 {
                         cap.run(&cpu.bus.io, &cpu.bus.palette, &cpu.bus.vram, &cpu.bus.oam);
+                    }
+                    let tc = t.elapsed() / 100;
+                    let t = std::time::Instant::now();
+                    for _ in 0..100 {
                         dio.render(cap);
                     }
-                    eprintln!("capture+render avg: {:.2?}", t.elapsed() / 100);
+                    eprintln!("capture avg: {:.2?}, render avg: {:.2?}", tc, t.elapsed() / 100);
                 }
                 // GBA_DUMP_LAYERS: false-color map of which BG layer won each
                 // pixel (R=bg0, G=bg1, B=bg2, R+G=bg3), brightness = priority.
@@ -319,12 +328,27 @@ fn main() -> ExitCode {
         },
     )
     .expect("failed to open window");
-    window.set_target_fps(60);
+    // GBA_UNCAP: disable the 60fps pacing sleep (perf measurement only).
+    if env::var("GBA_UNCAP").is_err() {
+        window.set_target_fps(60);
+    }
 
     let state_path = format!("{rom_path}.state");
     let mut frame_count = 0u64;
     let mut paused = false;
     let mut presented = vec![0u32; win_w * win_h];
+    // GBA_PERF: profile the real windowed loop over GBA_FRAMES presented
+    // frames with GBA_INPUT scripted keys, print per-stage averages, exit.
+    let perf = env::var("GBA_PERF").is_ok();
+    let perf_limit: u64 = env::var("GBA_FRAMES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600);
+    let perf_script = if perf { parse_input_script() } else { Vec::new() };
+    use std::time::{Duration, Instant};
+    let (mut perf_emu, mut perf_render, mut perf_present) =
+        (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+    let mut emu_frames = 0u64;
     while window.is_open() && !window.is_key_down(Key::Escape) {
         // F5 save state, F7 load state, P pause, hold Tab fast-forward.
         if window.is_key_pressed(Key::F5, minifb::KeyRepeat::No) {
@@ -365,6 +389,8 @@ fn main() -> ExitCode {
         } else {
             4
         };
+        let mut emulated = false;
+        let t_emu = Instant::now();
         for i in 0..max_frames {
             // Without audio output the queue never drains; fall back to one
             // frame per display refresh.
@@ -385,6 +411,16 @@ fn main() -> ExitCode {
                 cycles += c;
             }
             cpu.bus.frame_ready = false;
+            emulated = true;
+            emu_frames += 1;
+        }
+        perf_emu += t_emu.elapsed();
+        // Render the diorama once per presented frame, not per emulated
+        // frame: doing it inside the catch-up loop above multiplied its cost
+        // whenever the audio clock asked for 2+ frames, which snowballed
+        // into more catch-up (the "--3d is laggy" spiral).
+        if emulated {
+            let t = std::time::Instant::now();
             match (&mut capture, &mut diorama) {
                 (Some(cap), Some(dio)) => {
                     cap.run(&cpu.bus.io, &cpu.bus.palette, &cpu.bus.vram, &cpu.bus.oam);
@@ -393,13 +429,23 @@ fn main() -> ExitCode {
                 }
                 _ => presented.copy_from_slice(&cpu.bus.ppu.framebuffer),
             }
+            perf_render += t.elapsed();
         }
 
         // Keypad, active low: A=Z, B=X, Select=RShift, Start=Enter,
         // arrows = d-pad, L=Q, R=W. (Letters A/S are deliberately unbound:
         // players reach for "A" meaning the A button.)
+        if perf {
+            let mut held = 0u16;
+            for &(a, b, bits) in &perf_script {
+                if emu_frames >= a as u64 && emu_frames < b as u64 {
+                    held |= bits;
+                }
+            }
+            cpu.bus.keyinput = 0x3FF & !held;
+        }
         let k = |key| !window.is_key_down(key) as u16;
-        cpu.bus.keyinput = k(Key::Z)
+        let keyboard = k(Key::Z)
             | k(Key::X) << 1
             | k(Key::RightShift) << 2
             | k(Key::Enter) << 3
@@ -409,6 +455,9 @@ fn main() -> ExitCode {
             | k(Key::Down) << 7
             | k(Key::W) << 8
             | k(Key::Q) << 9;
+        if !perf {
+            cpu.bus.keyinput = keyboard;
+        }
 
         {
             let mut q = audio_queue.lock().unwrap();
@@ -423,11 +472,25 @@ fn main() -> ExitCode {
             }
         }
 
+        let t_present = Instant::now();
         window
             .update_with_buffer(&presented, win_w, win_h)
             .expect("window update failed");
+        perf_present += t_present.elapsed();
 
         frame_count += 1;
+        if perf && frame_count >= perf_limit {
+            let per = |d: Duration| d / frame_count as u32;
+            eprintln!(
+                "perf over {frame_count} presents ({emu_frames} emu frames): \
+                 emu {:?}/present, capture+render {:?}/present, \
+                 window update {:?}/present",
+                per(perf_emu),
+                per(perf_render),
+                per(perf_present)
+            );
+            break;
+        }
         if frame_count.is_multiple_of(60) && cpu.bus.save_dirty {
             cpu.bus.save_dirty = false;
             let _ = std::fs::write(&save_path, &cpu.bus.save);
