@@ -7,8 +7,10 @@ use std::env;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
-fn dump_frame(fb: &[u32], path: &str) {
-    let mut out = format!("P3\n{} {}\n255\n", ppu::WIDTH, ppu::HEIGHT);
+mod voxel;
+
+fn dump_frame(fb: &[u32], w: usize, h: usize, path: &str) {
+    let mut out = format!("P3\n{w} {h}\n255\n");
     for px in fb {
         out += &format!("{} {} {}\n", px >> 16 & 0xFF, px >> 8 & 0xFF, px & 0xFF);
     }
@@ -17,10 +19,11 @@ fn dump_frame(fb: &[u32], path: &str) {
 
 fn main() -> ExitCode {
     let Some(rom_path) = env::args().nth(1) else {
-        eprintln!("usage: gba <rom.gba> [--headless]");
+        eprintln!("usage: gba <rom.gba> [--headless] [--3d]");
         return ExitCode::FAILURE;
     };
     let headless = env::args().any(|a| a == "--headless");
+    let mode3d = env::args().any(|a| a == "--3d");
     let rom = std::fs::read(&rom_path).expect("failed to read ROM");
     let save_path = format!("{rom_path}.sav");
     let mut b = bus::Bus::new(rom);
@@ -37,6 +40,9 @@ fn main() -> ExitCode {
     eprintln!("save type: {}", b.save_type.name());
     let mut cpu = cpu::Cpu::new(b);
     cpu.bus.pal_trace = env::var("GBA_PALTRACE").is_ok();
+    // --3d: per-frame layer capture + diorama renderer (native only).
+    let mut capture = mode3d.then(ppu::Capture::default);
+    let mut diorama = mode3d.then(voxel::Renderer::new);
 
     // Region-aware cycles per instruction: IWRAM runs at full speed (the
     // m4a audio mixer lives there and needs the throughput), EWRAM has mild
@@ -130,10 +136,24 @@ fn main() -> ExitCode {
                     && n % k == 0
                 {
                     let _ = std::fs::create_dir_all(&dump_dir);
-                    dump_frame(
-                        &cpu.bus.ppu.framebuffer,
-                        &format!("{dump_dir}/frame{n:05}.ppm"),
-                    );
+                    match (&mut capture, &mut diorama) {
+                        (Some(cap), Some(dio)) => {
+                            cap.run(&cpu.bus.io, &cpu.bus.palette, &cpu.bus.vram, &cpu.bus.oam);
+                            dio.render(cap);
+                            dump_frame(
+                                &dio.buffer,
+                                voxel::WIDTH,
+                                voxel::HEIGHT,
+                                &format!("{dump_dir}/frame{n:05}.ppm"),
+                            );
+                        }
+                        _ => dump_frame(
+                            &cpu.bus.ppu.framebuffer,
+                            ppu::WIDTH,
+                            ppu::HEIGHT,
+                            &format!("{dump_dir}/frame{n:05}.ppm"),
+                        ),
+                    }
                 }
                 let mut held = 0u16;
                 for &(a, b, bits) in &script {
@@ -151,7 +171,14 @@ fn main() -> ExitCode {
                 eprintln!("hot {:#010X} x{}", pc, c);
             }
         }
-        dump_frame(&cpu.bus.ppu.framebuffer, "frame.ppm");
+        match (&mut capture, &mut diorama) {
+            (Some(cap), Some(dio)) => {
+                cap.run(&cpu.bus.io, &cpu.bus.palette, &cpu.bus.vram, &cpu.bus.oam);
+                dio.render(cap);
+                dump_frame(&dio.buffer, voxel::WIDTH, voxel::HEIGHT, "frame.ppm");
+            }
+            _ => dump_frame(&cpu.bus.ppu.framebuffer, ppu::WIDTH, ppu::HEIGHT, "frame.ppm"),
+        }
         if capture_audio {
             let raw: Vec<u8> = captured.iter().flat_map(|s| s.to_le_bytes()).collect();
             std::fs::write("samples.raw", raw).unwrap();
@@ -247,12 +274,18 @@ fn main() -> ExitCode {
     });
     let audio_ok = matches!(&stream, Some(Ok(_)));
 
+    // 3D mode renders at ~3x internally, so use a smaller window scale.
+    let (win_w, win_h, scale) = if mode3d {
+        (voxel::WIDTH, voxel::HEIGHT, Scale::X2)
+    } else {
+        (ppu::WIDTH, ppu::HEIGHT, Scale::X4)
+    };
     let mut window = Window::new(
         "gba",
-        ppu::WIDTH,
-        ppu::HEIGHT,
+        win_w,
+        win_h,
         WindowOptions {
-            scale: Scale::X4,
+            scale,
             ..Default::default()
         },
     )
@@ -262,7 +295,7 @@ fn main() -> ExitCode {
     let state_path = format!("{rom_path}.state");
     let mut frame_count = 0u64;
     let mut paused = false;
-    let mut presented = vec![0u32; ppu::WIDTH * ppu::HEIGHT];
+    let mut presented = vec![0u32; win_w * win_h];
     while window.is_open() && !window.is_key_down(Key::Escape) {
         // F5 save state, F7 load state, P pause, hold Tab fast-forward.
         if window.is_key_pressed(Key::F5, minifb::KeyRepeat::No) {
@@ -323,7 +356,14 @@ fn main() -> ExitCode {
                 cycles += c;
             }
             cpu.bus.frame_ready = false;
-            presented.copy_from_slice(&cpu.bus.ppu.framebuffer);
+            match (&mut capture, &mut diorama) {
+                (Some(cap), Some(dio)) => {
+                    cap.run(&cpu.bus.io, &cpu.bus.palette, &cpu.bus.vram, &cpu.bus.oam);
+                    dio.render(cap);
+                    presented.copy_from_slice(&dio.buffer);
+                }
+                _ => presented.copy_from_slice(&cpu.bus.ppu.framebuffer),
+            }
         }
 
         // Keypad, active low: A=Z, B=X, Select=RShift, Start=Enter,
@@ -355,7 +395,7 @@ fn main() -> ExitCode {
         }
 
         window
-            .update_with_buffer(&presented, ppu::WIDTH, ppu::HEIGHT)
+            .update_with_buffer(&presented, win_w, win_h)
             .expect("window update failed");
 
         frame_count += 1;

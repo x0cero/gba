@@ -85,7 +85,6 @@ impl Ppu {
     ) {
         let r16 = |off: usize| u16::from_le_bytes([io[off], io[off + 1]]);
         let dispcnt = r16(0);
-        let mode = dispcnt & 7;
         let backdrop = rgb555(u16::from_le_bytes([palette[0], palette[1]]));
         let row = &mut self.framebuffer[y as usize * WIDTH..(y as usize + 1) * WIDTH];
 
@@ -102,43 +101,7 @@ impl Ppu {
         if dispcnt & 0x1000 != 0 {
             Self::render_sprites(y, dispcnt, palette, vram, oam, &mut obj_line);
         }
-        for bg in 0..4u32 {
-            if dispcnt & (1 << (8 + bg)) == 0 {
-                continue;
-            }
-            let buf = &mut bg_line[bg as usize];
-            match (mode, bg) {
-                (0, _) | (1, 0) | (1, 1) => Self::draw_text_bg(y, bg, io, palette, vram, buf),
-                (1, 2) | (2, 2) | (2, 3) => {
-                    Self::draw_affine_bg(y, bg, io, palette, vram, buf, bg_ref)
-                }
-                (3, 2) => {
-                    for x in 0..WIDTH {
-                        let off = (y as usize * WIDTH + x) * 2;
-                        buf[x] = u16::from_le_bytes([vram[off], vram[off + 1]]) | 0x8000;
-                    }
-                }
-                (4, 2) => {
-                    let base = if dispcnt & 0x10 != 0 { 0xA000 } else { 0 };
-                    for x in 0..WIDTH {
-                        let pi = vram[base + y as usize * WIDTH + x] as u32;
-                        if pi != 0 {
-                            buf[x] = Self::pal256(palette, pi, false) | 0x8000;
-                        }
-                    }
-                }
-                (5, 2) => {
-                    if (y as usize) < 128 {
-                        let base = if dispcnt & 0x10 != 0 { 0xA000 } else { 0 };
-                        for x in 0..160.min(WIDTH) {
-                            let off = base + (y as usize * 160 + x) * 2;
-                            buf[x] = u16::from_le_bytes([vram[off], vram[off + 1]]) | 0x8000;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+        Self::draw_bg_layers(y, dispcnt, io, palette, vram, bg_ref, &mut bg_line);
 
         // Window configuration. Layer visibility masks per region.
         let win0_on = dispcnt & 0x2000 != 0;
@@ -270,6 +233,58 @@ impl Ppu {
                 top.0
             };
             row[x] = rgb555(final555);
+        }
+    }
+
+    /// Fill the four per-layer line buffers for line `y` (bit 15 = opaque).
+    /// Shared by normal compositing and the --3d layer capture.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_bg_layers(
+        y: u32,
+        dispcnt: u16,
+        io: &[u8],
+        palette: &[u8],
+        vram: &[u8],
+        bg_ref: &[(i32, i32); 2],
+        bg_line: &mut [[u16; WIDTH]; 4],
+    ) {
+        let mode = dispcnt & 7;
+        for bg in 0..4u32 {
+            if dispcnt & (1 << (8 + bg)) == 0 {
+                continue;
+            }
+            let buf = &mut bg_line[bg as usize];
+            match (mode, bg) {
+                (0, _) | (1, 0) | (1, 1) => Self::draw_text_bg(y, bg, io, palette, vram, buf),
+                (1, 2) | (2, 2) | (2, 3) => {
+                    Self::draw_affine_bg(y, bg, io, palette, vram, buf, bg_ref)
+                }
+                (3, 2) => {
+                    for x in 0..WIDTH {
+                        let off = (y as usize * WIDTH + x) * 2;
+                        buf[x] = u16::from_le_bytes([vram[off], vram[off + 1]]) | 0x8000;
+                    }
+                }
+                (4, 2) => {
+                    let base = if dispcnt & 0x10 != 0 { 0xA000 } else { 0 };
+                    for x in 0..WIDTH {
+                        let pi = vram[base + y as usize * WIDTH + x] as u32;
+                        if pi != 0 {
+                            buf[x] = Self::pal256(palette, pi, false) | 0x8000;
+                        }
+                    }
+                }
+                (5, 2) => {
+                    if (y as usize) < 128 {
+                        let base = if dispcnt & 0x10 != 0 { 0xA000 } else { 0 };
+                        for x in 0..160.min(WIDTH) {
+                            let off = base + (y as usize * 160 + x) * 2;
+                            buf[x] = u16::from_le_bytes([vram[off], vram[off + 1]]) | 0x8000;
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -528,6 +543,89 @@ impl Ppu {
                         };
                         Self::put_obj(&mut out[x as usize], c, prio, obj_mode);
                     }
+                }
+            }
+        }
+    }
+}
+
+/// Per-frame layer capture for the experimental --3d diorama renderer.
+/// Lives outside `Ppu` so save states are untouched; it re-renders the
+/// frame's layers from the raw PPU state (registers, palette, VRAM, OAM)
+/// once per presented frame. Mid-frame register writes and window/blend
+/// effects are ignored, which is fine for a stylized diorama view.
+#[derive(Default)]
+pub struct Capture {
+    /// BG-only composite (all enabled BG layers over the backdrop), ARGB.
+    pub bg_frame: Vec<u32>,
+    /// Sprite pixels that won compositing: (screen x, screen y, ARGB).
+    pub sprite_pixels: Vec<(u8, u8, u32)>,
+    /// Priority (0-3) of the winning BG layer per pixel; 4 = backdrop.
+    pub bg_prio: Vec<u8>,
+}
+
+impl Capture {
+    pub fn run(&mut self, io: &[u8], palette: &[u8], vram: &[u8], oam: &[u8]) {
+        let r16 = |off: usize| u16::from_le_bytes([io[off], io[off + 1]]);
+        let dispcnt = r16(0);
+        let backdrop555 = u16::from_le_bytes([palette[0], palette[1]]);
+        self.bg_frame.clear();
+        self.bg_frame.resize(WIDTH * HEIGHT, rgb555(backdrop555));
+        self.bg_prio.clear();
+        self.bg_prio.resize(WIDTH * HEIGHT, 4);
+        self.sprite_pixels.clear();
+        if dispcnt & 0x80 != 0 {
+            return; // forced blank
+        }
+        // Affine reference points, reloaded from the registers and stepped
+        // by PB/PD per line (mid-frame reloads are not modeled).
+        let mut bg_ref = [(0i32, 0i32); 2];
+        for (bg, r) in bg_ref.iter_mut().enumerate() {
+            let base = 0x28 + bg * 0x10;
+            let rd = |o: usize| {
+                let v = u32::from_le_bytes([io[o], io[o + 1], io[o + 2], io[o + 3]]);
+                ((v << 4) as i32) >> 4
+            };
+            *r = (rd(base), rd(base + 4));
+        }
+        for y in 0..HEIGHT as u32 {
+            let mut bg_line = [[0u16; WIDTH]; 4];
+            let mut obj_line = [ObjPixel::default(); WIDTH];
+            Ppu::draw_bg_layers(y, dispcnt, io, palette, vram, &bg_ref, &mut bg_line);
+            if dispcnt & 0x1000 != 0 {
+                Ppu::render_sprites(y, dispcnt, palette, vram, oam, &mut obj_line);
+            }
+            for (bg, r) in bg_ref.iter_mut().enumerate() {
+                let base = 0x22 + bg * 0x10;
+                r.0 += r16(base) as i16 as i32;
+                r.1 += r16(base + 4) as i16 as i32;
+            }
+            let row = y as usize * WIDTH;
+            for x in 0..WIDTH {
+                // Top BG pixel by priority, same search order as compositing.
+                let mut bg_top: Option<(u16, u8)> = None;
+                'bg: for prio in 0..4u8 {
+                    for bg in 0..4usize {
+                        if dispcnt & (1 << (8 + bg)) == 0
+                            || (r16(0x8 + bg * 2) & 3) as u8 != prio
+                        {
+                            continue;
+                        }
+                        let p = bg_line[bg][x];
+                        if p & 0x8000 != 0 {
+                            bg_top = Some((p & 0x7FFF, prio));
+                            break 'bg;
+                        }
+                    }
+                }
+                if let Some((c, prio)) = bg_top {
+                    self.bg_frame[row + x] = rgb555(c);
+                    self.bg_prio[row + x] = prio;
+                }
+                let obj = &obj_line[x];
+                if obj.opaque && obj.prio <= bg_top.map_or(4, |(_, p)| p) {
+                    self.sprite_pixels
+                        .push((x as u8, y as u8, rgb555(obj.color)));
                 }
             }
         }
