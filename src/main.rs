@@ -93,6 +93,10 @@ fn main() -> ExitCode {
         let mut n = 0;
         let dump_every: Option<u32> = env::var("GBA_DUMP_EVERY").ok().and_then(|v| v.parse().ok());
         let dump_dir = env::var("GBA_DUMP_DIR").unwrap_or_else(|_| "filmstrip".into());
+        // GBA_DUMP_FROM=N: skip the boot/menu frames, so a long scripted run
+        // only writes the stretch being inspected.
+        let dump_from: u32 =
+            env::var("GBA_DUMP_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         let trace_boot = env::var("GBA_BOOTTRACE").is_ok();
         let pc_hist: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
         let capture_audio = env::var("GBA_WAV").is_ok();
@@ -139,6 +143,7 @@ fn main() -> ExitCode {
                 if let Some(k) = dump_every
                     && k > 0
                     && n % k == 0
+                    && n >= dump_from
                 {
                     let _ = std::fs::create_dir_all(&dump_dir);
                     match (&mut capture, &mut diorama) {
@@ -202,14 +207,15 @@ fn main() -> ExitCode {
                     if let Some(g) = voxel::MapGrid::read(&cpu.bus) {
                         for (i, px) in dbg.iter_mut().enumerate() {
                             let (x, y) = (i % ppu::WIDTH, i / ppu::WIDTH);
-                            let cx = ((x + g.fine.0) / 16).min(voxel::MapGrid::COLS - 1);
-                            let cy = ((y + g.fine.1) / 16).min(voxel::MapGrid::ROWS - 1);
-                            let tint = match g.cells[cy * voxel::MapGrid::COLS + cx] {
+                            let tint = match g.cell_of_screen(x, y) {
                                 voxel::Cell::Flat => 0,
                                 voxel::Cell::Grass => 0x0000_C000,
                                 voxel::Cell::Water => 0x0000_00C0,
                                 voxel::Cell::Void => 0x00C0_00C0,
-                                voxel::Cell::Block(h, ..) => (0x60 + h as u32 * 2).min(255) << 16,
+                                voxel::Cell::Prop => 0x00C0_C000,
+                                voxel::Cell::Block { h, .. } => {
+                                    (0x60 + h as u32 * 2).min(255) << 16
+                                }
                             };
                             let mix = |a: u32, b: u32, s: u32| {
                                 ((a >> s & 0xFF) / 2 + (b >> s & 0xFF) / 2) << s
