@@ -47,6 +47,8 @@ const SKIP: u32 = 0xFFFF_FFFF;
 const STEP: f32 = 16.0;
 /// Water sits below ground so shorelines get a lip.
 const WATER: f32 = -3.0;
+/// How much taller than its map footprint a plant billboard stands.
+const PLANT_TALL: f32 = 1.5;
 
 #[inline]
 fn rgb555(c: u16) -> u32 {
@@ -317,7 +319,10 @@ pub enum Cell {
     /// is one canopy-over-trunk billboard, not two stacked blocks. `rows` = 0
     /// means this cell is covered by a billboard belonging to a cell further
     /// south and only draws its ground.
-    Bill { rows: u8 },
+    /// `plant` marks tree/bush art, whose picture lives in the metatile's
+    /// GROUND layer: painting that layer as floor under the billboard laid the
+    /// canopy out flat as a pale green shelf with a small tree standing on it.
+    Bill { rows: u8, plant: bool },
     /// Part of a solid volume standing on this cell.
     ///
     /// `h` world height, `n` cells the volume spans north-to-south, `k` this
@@ -597,7 +602,7 @@ impl MapGrid {
                 }
                 let cell = match kind(gx, gy) {
                     Kind::Plant => Self::plant(gx, gy, &kind, &entry),
-                    Kind::Thin => Cell::Bill { rows: 1 },
+                    Kind::Thin => Cell::Bill { rows: 1, plant: false },
                     Kind::Struct => Self::structure(gx, gy, &kind, &entry),
                     Kind::Open if is_water(e) => Cell::Water,
                     Kind::Open => match behavior(e) {
@@ -674,43 +679,66 @@ impl MapGrid {
     /// Which billboard a plant cell belongs to.
     ///
     /// Top-down tree art stacks a canopy over a trunk, and a tree BORDER
-    /// repeats that stack down the column. So we find the column's run of
-    /// plant cells, find the shortest repeat in it, and make each repeat one
-    /// object: a two-cell tree border becomes a row of discrete trees rather
-    /// than one continuous hedge, while a single four-cell tree stays one
-    /// four-cell tree. The object's southernmost cell carries the billboard.
+    /// repeats that stack down the column. Each repeat is one tree: a border
+    /// of two-cell trees becomes a row of discrete trees rather than one
+    /// continuous hedge, and the tree's southernmost cell carries the whole
+    /// billboard while the cells above it only draw floor.
+    ///
+    /// Every judgement here is made from a fixed window of cells AROUND
+    /// (gx, gy), never from where a run of trees happens to start or end.
+    /// The previous version walked to the top of the run and split it into
+    /// repeats from there, but the walk was capped at twelve cells, so in a
+    /// tree border longer than that each cell measured its groups from a
+    /// different starting row and disagreed about which cell was the front
+    /// one. Nearly every cell then decided a neighbour carried the billboard,
+    /// and Pallet's tree line drew as bare floor with the odd tree left in it.
     fn plant(
         gx: i32,
         gy: i32,
         kind: &impl Fn(i32, i32) -> Kind,
         entry: &impl Fn(i32, i32) -> Option<u16>,
     ) -> Cell {
-        const MAX: i32 = 12;
-        let mut top = gy;
-        while gy - top < MAX && kind(gx, top - 1) == Kind::Plant {
-            top -= 1;
-        }
-        let mut bot = gy;
-        while bot - gy < MAX && kind(gx, bot + 1) == Kind::Plant {
-            bot += 1;
-        }
-        let len = (bot - top + 1) as usize;
-        let j = (gy - top) as usize;
-        let id = |i: usize| entry(gx, top + i as i32).unwrap_or(0) & 0x3FF;
-        let mut p = len;
-        for q in 1..len.min(5) {
-            if (0..len - q).all(|i| id(i) == id(i + q)) {
+        // Metatile id of a plant cell relative to this one, None if the cell
+        // holds something else.
+        let id = |dy: i32| -> Option<u16> {
+            (kind(gx, gy + dy) == Kind::Plant).then(|| entry(gx, gy + dy).unwrap_or(0) & 0x3FF)
+        };
+        const R: i32 = 4;
+        // Shortest vertical repeat of the artwork around this cell, 1-4.
+        let mut p = 1i32;
+        for q in 1..=R {
+            let matches = (-R..=R).all(|i| match (id(i), id(i + q)) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            });
+            if matches {
                 p = q;
                 break;
             }
         }
-        let group = j / p;
-        let south = ((group + 1) * p - 1).min(len - 1);
-        if j == south {
-            Cell::Bill { rows: (south - group * p + 1) as u8 }
-        } else {
-            Cell::Bill { rows: 0 }
+        // Which cell of the repeat is the tree's FRONT. It has to be a
+        // property of the artwork, not of the window, or the split would slide
+        // by a cell as the camera moves. Taking the largest metatile id in the
+        // repeat is arbitrary but stable, and in FireRed's tilesets a tree's
+        // lower half is stored after its upper half, so it picks the trunk.
+        let mut south = 0i32;
+        let mut best = id(0);
+        for t in 1..p {
+            if id(t) > best {
+                best = id(t);
+                south = t;
+            }
         }
+        if south != 0 {
+            return Cell::Bill { rows: 0, plant: true }; // a cell below carries it
+        }
+        // How many cells of the repeat above this one are really plants (the
+        // top of a border column may be cut short by the map edge).
+        let mut rows = 1u8;
+        while (rows as i32) < p && id(-(rows as i32)).is_some() {
+            rows += 1;
+        }
+        Cell::Bill { rows, plant: true }
     }
 
     /// Decide what built volume the cell at (gx, gy) belongs to, purely from
@@ -745,7 +773,7 @@ impl MapGrid {
         let j = (gy - top) as usize; // index from the run's north end
         let id = |i: usize| entry(gx, top + i as i32).unwrap_or(0) & 0x3FF;
         if len == 1 {
-            return Cell::Bill { rows: 1 };
+            return Cell::Bill { rows: 1, plant: false };
         }
         if (0..len - 1).all(|i| id(i) == id(i + 1)) {
             return Cell::Block { h: STEP, n: 1, k: 0, wall: 0 };
@@ -1022,16 +1050,37 @@ impl Renderer {
                 // metatile's BOTTOM layer only, so a fence is not also painted
                 // flat on the floor underneath itself (which read as the fence
                 // hovering over its own shadow).
-                if let Cell::Bill { rows } = cell {
+                if let Cell::Bill { rows, plant } = cell {
                     let ground =
                         [project(x0, 0.0, zn), project(x1, 0.0, zn), project(x1, 0.0, zs), project(x0, 0.0, zs)];
-                    self.quad_uv(ground, &mut |u, v| {
-                        g.art.bot_at(
-                            slot,
-                            (u * 16.0).clamp(0.0, 15.0) as usize,
-                            (v * 16.0).clamp(0.0, 15.0) as usize,
-                        )
-                    });
+                    // A fence or a sign is an overlay drawn over real ground,
+                    // so its bottom layer IS the floor. A tree is not: FireRed
+                    // draws the canopy itself in the ground layer, so painting
+                    // that layer flat gave every tree a pale green shelf under
+                    // it and turned the Pallet tree border into terraces. Take
+                    // the floor from the nearest open cell instead and darken
+                    // it: what is under a canopy is shaded grass.
+                    if plant {
+                        let (gs, dark) = g.floor_near(cx, cy);
+                        self.quad_uv(ground, &mut |u, v| {
+                            shade(
+                                g.art.comp_at(
+                                    gs,
+                                    (u * 16.0).clamp(0.0, 15.0) as usize,
+                                    (v * 16.0).clamp(0.0, 15.0) as usize,
+                                ),
+                                dark,
+                            )
+                        });
+                    } else {
+                        self.quad_uv(ground, &mut |u, v| {
+                            g.art.bot_at(
+                                slot,
+                                (u * 16.0).clamp(0.0, 15.0) as usize,
+                                (v * 16.0).clamp(0.0, 15.0) as usize,
+                            )
+                        });
+                    }
                     if rows == 0 {
                         continue; // a billboard further south covers this cell
                     }
@@ -1040,12 +1089,21 @@ impl Renderer {
                     // by the tile edge: fence art sits in the upper part of its
                     // tile, and hanging that from the tile edge left the fence
                     // floating above the grass.
-                    let pad = if g.art.cover[slot] > 0.05 {
+                    // Only an overlay (fence, sign) is stood on its lowest
+                    // drawn row; a tree's picture fills its tile.
+                    let pad = if !plant && g.art.cover[slot] > 0.05 {
                         (15 - g.art.ymax[slot].max(0)) as f32
                     } else {
                         0.0
                     };
-                    let hgt = (r * 16) as f32 - pad;
+                    let art_h = (r * 16) as f32 - pad;
+                    // A tree drawn from above is not as tall as it is wide;
+                    // standing its art up at 1:1 left a stubby 16-pixel bush
+                    // per cell with bare floor showing between the row. Real
+                    // trees are taller than their footprint, and stretching
+                    // them is also what makes a border row of them overlap
+                    // into one dense canopy instead of a dotted line.
+                    let hgt = if plant { art_h * PLANT_TALL } else { art_h };
                     let (uy, uz) = (COS_P, SIN_P);
                     let q = [
                         project(x0, hgt * uy, zs + hgt * uz),
@@ -1055,14 +1113,23 @@ impl Renderer {
                     ];
                     let n0 = cy - r + 1;
                     self.quad_uv(q, &mut |u, v| {
-                        let gv = v.clamp(0.0, 0.999) * hgt;
+                        let gv = v.clamp(0.0, 0.999) * art_h;
                         let sc = (gv as i32 / 16).min(r - 1);
                         let src = g.slot_at(cx, n0 + sc, slot);
-                        g.art.object_at(
-                            src,
+                        let (ax, ay) = (
                             (u * 16.0).clamp(0.0, 15.0) as usize,
                             (gv - (sc * 16) as f32).clamp(0.0, 15.0) as usize,
-                        )
+                        );
+                        // A tree stands up as its WHOLE picture. Its canopy is
+                        // painted in the metatile's ground layer with only a
+                        // few overhanging pixels on the top layer, so taking
+                        // the top layer alone (right for a fence standing on
+                        // grass) left a bare sliver of leaves in the air.
+                        if plant {
+                            g.art.comp_at(src, ax, ay)
+                        } else {
+                            g.art.object_at(src, ax, ay)
+                        }
                     });
                     continue;
                 }
@@ -1168,35 +1235,67 @@ impl Renderer {
     fn render_sprites(&mut self, cap: &Capture, mgrid: &MapGrid) {
         const W: usize = ppu::WIDTH;
         let mut grid: Vec<u32> = vec![0; W * ppu::HEIGHT];
-        for &(px, py, color) in &cap.sprite_pixels {
-            grid[py as usize * W + px as usize] = color | 0xFF00_0000;
-        }
-        let mut seen = vec![false; W * ppu::HEIGHT];
-        for &(sx, sy, _) in &cap.sprite_pixels {
-            let start = sy as usize * W + sx as usize;
-            if seen[start] {
-                continue;
-            }
-            // Flood fill (8-connected, tolerant of 1px gaps via radius 2).
-            let mut stack = vec![start];
-            let mut pixels: Vec<usize> = Vec::new();
-            seen[start] = true;
-            while let Some(i) = stack.pop() {
-                pixels.push(i);
-                let (x, y) = (i % W, i / W);
-                for dy in -2i32..=2 {
-                    for dx in -2i32..=2 {
-                        let (nx, ny) = (x as i32 + dx, y as i32 + dy);
-                        if nx < 0 || ny < 0 || nx >= W as i32 || ny >= ppu::HEIGHT as i32 {
-                            continue;
-                        }
-                        let j = ny as usize * W + nx as usize;
-                        if grid[j] != 0 && !seen[j] {
-                            seen[j] = true;
-                            stack.push(j);
-                        }
-                    }
+        // Group sprite pixels by the OAM object that drew them. Grouping by
+        // "pixels that touch each other" used to fuse the player with an NPC
+        // standing right beside him into ONE figure: the pair got a single
+        // billboard anchored at the lower one's feet (so the other appeared
+        // lifted, and drew in front of him) under one merged blob of shadow.
+        let mut group = vec![usize::MAX; 256];
+        let mut boxes: Vec<[i32; 4]> = Vec::new(); // minx, maxx, miny, maxy
+        let mut owner: Vec<u16> = vec![u16::MAX; W * ppu::HEIGHT];
+        for &(px, py, color, obj) in &cap.sprite_pixels {
+            let (x, y) = (px as i32, py as i32);
+            let g = match group[obj as usize] {
+                usize::MAX => {
+                    group[obj as usize] = boxes.len();
+                    boxes.push([x, x, y, y]);
+                    boxes.len() - 1
                 }
+                g => {
+                    let b = &mut boxes[g];
+                    b[0] = b[0].min(x);
+                    b[1] = b[1].max(x);
+                    b[2] = b[2].min(y);
+                    b[3] = b[3].max(y);
+                    g
+                }
+            };
+            grid[py as usize * W + px as usize] = color | 0xFF00_0000;
+            owner[py as usize * W + px as usize] = g as u16;
+        }
+        // One figure CAN be several OAM objects (a big sprite split in two).
+        // Merge groups that overlap on screen and stand on the same row; two
+        // characters one map cell apart are 16 pixels apart, so they stay
+        // separate.
+        let mut find = (0..boxes.len()).collect::<Vec<usize>>();
+        fn root(f: &mut [usize], mut i: usize) -> usize {
+            while f[i] != i {
+                f[i] = f[f[i]];
+                i = f[i];
+            }
+            i
+        }
+        for a in 0..boxes.len() {
+            for b in 0..a {
+                let (p, q) = (boxes[a], boxes[b]);
+                let overlap = p[0] <= q[1] && q[0] <= p[1] && p[2] <= q[3] && q[2] <= p[3];
+                if overlap && (p[3] - q[3]).abs() <= 4 {
+                    let (ra, rb) = (root(&mut find, a), root(&mut find, b));
+                    find[ra] = rb;
+                }
+            }
+        }
+        let mut figures: Vec<Vec<usize>> = vec![Vec::new(); boxes.len()];
+        for (i, o) in owner.iter_mut().enumerate() {
+            if *o != u16::MAX {
+                let r = root(&mut find, *o as usize);
+                *o = r as u16;
+                figures[r].push(i);
+            }
+        }
+        for (fig, pixels) in figures.iter().enumerate() {
+            if pixels.is_empty() {
+                continue;
             }
             // Figure extents: feet = lowest pixel row.
             let feet = pixels.iter().map(|i| i / W).max().unwrap() as f32 + 1.0;
@@ -1207,14 +1306,23 @@ impl Renderer {
             // on the ground behind it in world space, and the depth buffer
             // occludes it naturally (the silhouette pass shows the player
             // through).
-            let (fy, fx) = (
-                (feet as usize - 1).min(ppu::HEIGHT - 1),
-                ((min_x + max_x) as usize / 2).min(W - 1),
-            );
-            let ground = match mgrid.cell_of_screen(fx, fy) {
-                Cell::Water => WATER,
-                _ => 0.0,
-            };
+            //
+            // A character sprite hangs a few pixels below the map cell he
+            // occupies, so the bottom pixel row alone reported the cell SOUTH
+            // of him. On the bank of a pond that cell is water, and the player
+            // was drawn standing on the sunken water surface. Take the highest
+            // ground under the sprite's lower body instead.
+            let fx = ((min_x + max_x) as usize / 2).min(W - 1);
+            let ground = [2usize, 8, 14]
+                .iter()
+                .map(|d| {
+                    let fy = (feet as usize).saturating_sub(*d).min(ppu::HEIGHT - 1);
+                    match mgrid.cell_of_screen(fx, fy) {
+                        Cell::Water => WATER,
+                        _ => 0.0,
+                    }
+                })
+                .fold(f32::NEG_INFINITY, f32::max);
 
             // Contact shadow first (drawn onto the ground, no z write).
             let (ccx, cw) = ((min_x + max_x) / 2.0, (max_x - min_x) / 2.0);
@@ -1261,8 +1369,11 @@ impl Renderer {
             let mut sampler = |u: f32, v: f32| {
                 let sx = (min_x + (u * bw).min(bw - 0.5)) as usize;
                 let sy = (top + (v * bh).min(bh - 0.5)) as usize;
-                let c = grid[sy.min(ppu::HEIGHT - 1) * W + sx.min(W - 1)];
-                if c == 0 { SKIP } else { c & 0x00FF_FFFF }
+                let i = sy.min(ppu::HEIGHT - 1) * W + sx.min(W - 1);
+                // Only this figure's own pixels: the quads of two characters
+                // standing side by side overlap, and without the mask each
+                // would paint bits of the other at its own depth.
+                if owner[i] != fig as u16 { SKIP } else { grid[i] & 0x00FF_FFFF }
             };
             self.quad_uv(q, &mut sampler);
             // Repaint the figure closest to screen center (the player) as a
@@ -1278,6 +1389,23 @@ impl Renderer {
 }
 
 impl MapGrid {
+    /// Floor art to paint under a plant, plus how much to darken it: the
+    /// nearest cell that is real walkable ground, searched outward, shaded
+    /// like the shadow under a canopy. Deep inside a forest there is no open
+    /// cell nearby, and the answer is the darkest shade over whatever ground
+    /// layer this cell has, which reads as unlit undergrowth.
+    fn floor_near(&self, cx: i32, cy: i32) -> (usize, f32) {
+        for r in 1..=3i32 {
+            for (dx, dy) in [(0, r), (r, 0), (-r, 0), (0, -r)] {
+                let (nx, ny) = (cx + dx, cy + dy);
+                if matches!(self.at(nx, ny), Cell::Flat | Cell::Grass) {
+                    return (self.slot_at(nx, ny, 0), 0.62);
+                }
+            }
+        }
+        (self.slot_at(cx, cy, 0), 0.34)
+    }
+
     /// Art slot of a cell in the window, falling back to `def` outside it.
     /// Only volumes taller than the north or south margin can reach outside,
     /// which happens many cells beyond the visible frame.

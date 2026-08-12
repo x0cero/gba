@@ -18,6 +18,9 @@ struct ObjPixel {
     opaque: bool,
     semi: bool,   // OAM mode 1: semi-transparent
     window: bool, // OAM mode 2: contributes to the object window
+    /// OAM index of the object that wrote this pixel. Only the --3d capture
+    /// uses it, to tell two touching figures apart.
+    obj: u8,
 }
 
 fn blend(a: u16, b: u16, eva: u32, evb: u32) -> u16 {
@@ -394,7 +397,7 @@ impl Ppu {
         }
     }
 
-    fn put_obj(px: &mut ObjPixel, color: u16, prio: u8, mode: u32) {
+    fn put_obj(px: &mut ObjPixel, color: u16, prio: u8, mode: u32, obj: u8) {
         if mode == 2 {
             px.window = true;
             return;
@@ -403,6 +406,7 @@ impl Ppu {
         px.prio = prio;
         px.opaque = true;
         px.semi = mode == 1;
+        px.obj = obj;
     }
 
     fn render_sprites(
@@ -517,7 +521,7 @@ impl Ppu {
                         } else {
                             Self::pal16(palette, pal_bank, ci, true)
                         };
-                        Self::put_obj(&mut out[x as usize], c, prio, obj_mode);
+                        Self::put_obj(&mut out[x as usize], c, prio, obj_mode, i as u8);
                     }
                 }
             } else {
@@ -541,7 +545,7 @@ impl Ppu {
                         } else {
                             Self::pal16(palette, pal_bank, ci, true)
                         };
-                        Self::put_obj(&mut out[x as usize], c, prio, obj_mode);
+                        Self::put_obj(&mut out[x as usize], c, prio, obj_mode, i as u8);
                     }
                 }
             }
@@ -558,8 +562,11 @@ impl Ppu {
 pub struct Capture {
     /// BG-only composite (all enabled BG layers over the backdrop), ARGB.
     pub bg_frame: Vec<u32>,
-    /// Sprite pixels that won compositing: (screen x, screen y, ARGB).
-    pub sprite_pixels: Vec<(u8, u8, u32)>,
+    /// Sprite pixels that won compositing: (screen x, screen y, ARGB, OAM
+    /// index). The OAM index is what separates two figures standing against
+    /// each other: grouping sprite pixels by touching neighbours merged the
+    /// player and the NPC beside him into one tall billboard.
+    pub sprite_pixels: Vec<(u8, u8, u32, u8)>,
     /// Priority (0-3) of the winning BG layer per pixel; 4 = backdrop.
     pub bg_prio: Vec<u8>,
     /// Index (0-3) of the winning BG layer per pixel; 4 = backdrop.
@@ -666,8 +673,18 @@ impl Capture {
                     && obj.prio <= bg_top.map_or(4, |(_, p, _)| p)
                     && ui.is_none_or(|up| obj.prio <= up)
                 {
-                    self.sprite_pixels
-                        .push((x as u8, y as u8, rgb555(obj.color)));
+                    if ui.is_some() {
+                        // A sprite drawn over a BG0 window is UI content, not
+                        // a figure in the world: the Pokemon portrait in the
+                        // starter-choice popup, cursors, party icons. Those
+                        // must composite flat with the window they sit in,
+                        // otherwise the window draws as an empty white box and
+                        // the portrait is lost somewhere in the diorama.
+                        self.ui_frame[row + x] = 0xFF00_0000 | rgb555(obj.color);
+                    } else {
+                        self.sprite_pixels
+                            .push((x as u8, y as u8, rgb555(obj.color), obj.obj));
+                    }
                 }
             }
         }
