@@ -212,7 +212,7 @@ fn main() -> ExitCode {
                                 voxel::Cell::Grass => 0x0000_C000,
                                 voxel::Cell::Water => 0x0000_00C0,
                                 voxel::Cell::Void => 0x00C0_00C0,
-                                voxel::Cell::Prop => 0x00C0_C000,
+                                voxel::Cell::Bill { .. } => 0x00C0_C000,
                                 voxel::Cell::Block { h, .. } => {
                                     (0x60 + h as u32 * 2).min(255) << 16
                                 }

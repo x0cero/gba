@@ -95,6 +95,19 @@ pub struct Art {
     comp: Vec<u32>,
     /// Top layer only; SKIP where transparent.
     top: Vec<u32>,
+    /// Bottom layer only (the ground the top layer is drawn over).
+    bot: Vec<u32>,
+    /// Fraction of the top layer that is actually drawn (0 = the metatile's
+    /// whole picture lives in the ground layer, 1 = the top layer hides it).
+    cover: Vec<f32>,
+    /// Lowest drawn row of the top layer, 0..15, or -1 when nothing is drawn.
+    /// A billboard is stood on the ground by THIS row, not by the tile edge,
+    /// which is what stops fences hovering above their own shadow.
+    ymax: Vec<i32>,
+    /// True when the metatile's OBJECT (its top layer, or the whole tile when
+    /// the art lives in the ground layer) is dominated by green: a plant.
+    /// Plants stand up as billboards, built structures are extruded as solids.
+    leaf: Vec<bool>,
     /// Flat material color (average of the composite), for unpainted faces.
     flat: Vec<u32>,
     /// True when the composite is essentially all black: FireRed pads the
@@ -111,6 +124,10 @@ impl Art {
         Art {
             comp: Vec::new(),
             top: Vec::new(),
+            bot: Vec::new(),
+            cover: Vec::new(),
+            ymax: Vec::new(),
+            leaf: Vec::new(),
             flat: Vec::new(),
             dark: Vec::new(),
             slot: vec![-1; 1024],
@@ -122,9 +139,21 @@ impl Art {
         self.comp[slot * 256 + y * 16 + x]
     }
 
+    /// The object's own pixels: the top layer where the metatile has one,
+    /// otherwise the whole tile (art drawn entirely in the ground layer has
+    /// nothing behind it to show through).
     #[inline]
-    fn top_at(&self, slot: usize, x: usize, y: usize) -> u32 {
-        self.top[slot * 256 + y * 16 + x]
+    fn object_at(&self, slot: usize, x: usize, y: usize) -> u32 {
+        if self.cover[slot] > 0.05 {
+            self.top[slot * 256 + y * 16 + x]
+        } else {
+            self.comp[slot * 256 + y * 16 + x]
+        }
+    }
+
+    #[inline]
+    fn bot_at(&self, slot: usize, x: usize, y: usize) -> u32 {
+        self.bot[slot * 256 + y * 16 + x]
     }
 }
 
@@ -206,16 +235,46 @@ impl ArtSource<'_> {
         };
         let mut comp = [0u32; 256];
         let mut top = [SKIP; 256];
-        for (quad, out_top) in [(0u32, false), (4, true)] {
-            for q in 0..4u32 {
-                let e = self.rd16(def + (quad + q) * 2);
-                let (ox, oy) = ((q as usize & 1) * 8, (q as usize / 2) * 8);
-                self.blit_tile(e, &mut comp, ox, oy, out_top);
-                if out_top {
-                    self.blit_tile(e, &mut top, ox, oy, true);
-                }
+        for q in 0..4u32 {
+            let e = self.rd16(def + q * 2);
+            let (ox, oy) = ((q as usize & 1) * 8, (q as usize / 2) * 8);
+            self.blit_tile(e, &mut comp, ox, oy, false);
+        }
+        let bot = comp;
+        for q in 0..4u32 {
+            let e = self.rd16(def + (4 + q) * 2);
+            let (ox, oy) = ((q as usize & 1) * 8, (q as usize / 2) * 8);
+            self.blit_tile(e, &mut comp, ox, oy, true);
+            self.blit_tile(e, &mut top, ox, oy, true);
+        }
+        // How much of the tile the top layer actually draws, and how far down
+        // it reaches: a fence, a sign or a tree is a partial overlay standing
+        // on drawn ground, while a house wall covers its tile completely.
+        let mut drawn = 0u32;
+        let mut ymax = -1i32;
+        for (i, &c) in top.iter().enumerate() {
+            if c != SKIP {
+                drawn += 1;
+                ymax = ymax.max((i / 16) as i32);
             }
         }
+        let cover = drawn as f32 / 256.0;
+        art.cover.push(cover);
+        art.ymax.push(ymax);
+        // Green dominance of the object itself. Judging the composite would
+        // call a grey fence standing in grass a plant, so when the tile has a
+        // real top layer only those pixels count.
+        let (mut lr, mut lg, mut lb) = (1u32, 1u32, 1u32);
+        for (i, &c) in comp.iter().enumerate() {
+            if cover > 0.05 && top[i] == SKIP {
+                continue;
+            }
+            let c = if cover > 0.05 { top[i] } else { c };
+            lr += c >> 16 & 0xFF;
+            lg += c >> 8 & 0xFF;
+            lb += c & 0xFF;
+        }
+        art.leaf.push(lg * 100 > lr * 118 && lg * 100 > lb * 118);
         // Flat material color and the all-black test.
         let (mut r, mut g, mut b, mut lit) = (0u32, 0u32, 0u32, 0u32);
         for &c in comp.iter() {
@@ -228,6 +287,7 @@ impl ArtSource<'_> {
         }
         art.comp.extend_from_slice(&comp);
         art.top.extend_from_slice(&top);
+        art.bot.extend_from_slice(&bot);
         art.flat.push((r / 256) << 16 | (g / 256) << 8 | (b / 256));
         art.dark.push(lit * 8 < 256);
         slot
@@ -247,10 +307,17 @@ pub enum Cell {
     /// Nothing here: outside the real map, or one of FireRed's black padding
     /// metatiles. Never drawn, so the background shows through.
     Void,
-    /// A one-cell solid: signpost, mailbox, small rock. Rendered as the ground
-    /// underneath plus a flat upright billboard of the metatile's TOP layer.
-    /// Never an extruded cube wearing its own art as a roof.
-    Prop,
+    /// Scenery that stands on the ground rather than being part of it: a tree,
+    /// a fence, a signpost, a bush. Rendered as the ground underneath (the
+    /// metatile's BOTTOM layer, so the object is not also painted flat on the
+    /// floor) plus one upright billboard of the object's own art.
+    ///
+    /// `rows` is how many cells the billboard spans north from this one, and
+    /// only the object's SOUTHERNMOST cell carries it: a tree two cells tall
+    /// is one canopy-over-trunk billboard, not two stacked blocks. `rows` = 0
+    /// means this cell is covered by a billboard belonging to a cell further
+    /// south and only draws its ground.
+    Bill { rows: u8 },
     /// Part of a solid volume standing on this cell.
     ///
     /// `h` world height, `n` cells the volume spans north-to-south, `k` this
@@ -276,6 +343,35 @@ pub struct MapGrid {
     /// row 0. Both move continuously with the camera.
     ox: f32,
     oz: f32,
+}
+
+/// What a blocked map cell actually is, judged from its artwork.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    /// Not blocked geometry at all (walkable, water, void).
+    Open,
+    /// A plant: green artwork. Stands up as a billboard.
+    Plant,
+    /// A fence, railing, sign or post: a partial overlay in a line one cell
+    /// thick. Stands up as a billboard, one per cell.
+    Thin,
+    /// A built volume: house, cliff, counter. Extruded.
+    Struct,
+}
+
+/// Camera state carried between frames: the last raw scroll registers, the
+/// integrated camera position in map pixels, and which map it belongs to.
+#[derive(Clone, Copy)]
+struct Cam {
+    hofs: i32,
+    vofs: i32,
+    x: i32,
+    y: i32,
+    map: u32,
+}
+
+thread_local! {
+    static CAM: std::cell::Cell<Option<Cam>> = const { std::cell::Cell::new(None) };
 }
 
 /// Cells of margin kept outside the visible frame on each side. North needs
@@ -386,11 +482,12 @@ impl MapGrid {
             // produces garbage.
             rd16(grid_ptr + ((vy * vwidth + vx) * 2) as u32).filter(|&e| e & 0x3FF != 0x3FF)
         };
-        let behavior = |e: u16| -> u32 {
+        let attrs = |e: u16| -> u32 {
             let m = (e & 0x3FF) as u32;
             let a = if m < 0x280 { rd32(aprim + m * 4) } else { rd32(asec + (m - 0x280) * 4) };
-            a.unwrap_or(0) & 0x1FF
+            a.unwrap_or(0)
         };
+        let behavior = |e: u16| attrs(e) & 0x1FF;
         let is_water = |e: u16| (0x10..=0x2F).contains(&behavior(e));
         // A cell is solid geometry when the game blocks movement into it and
         // it is not water (water is blocked too, until you have Surf).
@@ -401,9 +498,43 @@ impl MapGrid {
         // Screen top-left cell: the player cell is centered at screen cell
         // (7, 5); fine scroll from the ground layer's BG registers.
         let r16io = |off: usize| u16::from_le_bytes([bus.io[off], bus.io[off + 1]]);
-        let (hofs, vofs) = (r16io(0x18) & 0x1FF, r16io(0x1A) & 0x1FF);
-        let fine = ((hofs % 16) as usize, (vofs % 16) as usize);
-        let (gx0, gy0) = (px - 7 - MX, py - 5 - MY_N);
+        let (hofs, vofs) = ((r16io(0x18) & 0x1FF) as i32, (r16io(0x1A) & 0x1FF) as i32);
+        // The camera has to be ONE continuous quantity. The player's map
+        // coordinate is not it: FireRed snaps that to the destination cell on
+        // the first frame of a step and then slides the hardware scroll there
+        // over the following sixteen frames. Building the camera out of
+        // "player cell * 16 + scroll fraction" therefore jumped a whole cell
+        // forward at each step and slid a whole cell back as the fraction
+        // wrapped, which is the bounce. So we integrate the scroll registers
+        // (continuous, but only known modulo 512) and use the player cell just
+        // to place that reading in map space when we first pick it up or when
+        // the map changes under us.
+        let snap = (px * 16 + hofs.rem_euclid(16), py * 16 + vofs.rem_euclid(16));
+        let prev = CAM.with(|c| c.get());
+        let (mut camx, mut camy) = match prev {
+            Some(p) if p.map == grid_ptr => {
+                // The scroll registers wrap (FireRed keeps them inside one
+                // 256-pixel BG map), so a frame's motion is the smallest
+                // signed difference, never the raw one.
+                let d = |now: i32, was: i32| (now - was + 128).rem_euclid(256) - 128;
+                (p.x + d(hofs, p.hofs), p.y + d(vofs, p.vofs))
+            }
+            _ => snap,
+        };
+        // A warp, a door or a camera cut moves the world by more than a step
+        // can account for: re-anchor rather than drift.
+        if (camx - snap.0).abs() > 48 {
+            camx = snap.0;
+        }
+        if (camy - snap.1).abs() > 48 {
+            camy = snap.1;
+        }
+        CAM.with(|c| c.set(Some(Cam { hofs, vofs, x: camx, y: camy, map: grid_ptr })));
+        let fine = (camx.rem_euclid(16) as usize, camy.rem_euclid(16) as usize);
+        let (gx0, gy0) = (camx.div_euclid(16) - 7 - MX, camy.div_euclid(16) - 5 - MY_N);
+        if std::env::var("GBA_3D_CAM").is_ok() {
+            eprintln!("cam: player=({px},{py}) scroll=({hofs},{vofs}) camera=({camx},{camy})");
+        }
 
         let src = ArtSource {
             rom: &bus.rom,
@@ -414,7 +545,34 @@ impl MapGrid {
             // ground layer's control register rather than assuming zero.
             char_base: ((r16io(0x0C) >> 2) & 3) as usize * 0x4000,
         };
-        let mut art = Art::new();
+        let art = std::cell::RefCell::new(Art::new());
+        let slot_of = |e: u16| -> usize { src.decode(&mut art.borrow_mut(), e) };
+
+        // What KIND of thing a blocked cell holds decides its geometry, and
+        // the answer has to come from the metatile's own artwork, not from how
+        // long a vertical run of blocked cells happens to be. A tree border
+        // and a house wall are both tall runs of blocked cells; extruding both
+        // is what turned Pallet's tree line into a smeared hedge.
+        let kind = |gx: i32, gy: i32| -> Kind {
+            let Some(e) = entry(gx, gy) else { return Kind::Open };
+            if e >> 10 & 3 == 0 || is_water(e) {
+                return Kind::Open;
+            }
+            let s = slot_of(e);
+            let a = art.borrow();
+            if a.dark[s] {
+                return Kind::Open;
+            }
+            if a.leaf[s] {
+                return Kind::Plant;
+            }
+            let thin_ns = !solid(gx, gy - 1) && !solid(gx, gy + 1);
+            let thin_we = !solid(gx - 1, gy) && !solid(gx + 1, gy);
+            if a.cover[s] > 0.05 && a.cover[s] < 0.75 && (thin_ns || thin_we) {
+                return Kind::Thin;
+            }
+            Kind::Struct
+        };
 
         let mut cells = Vec::with_capacity(Self::COLS * Self::ROWS);
         let mut slots = Vec::with_capacity(Self::COLS * Self::ROWS);
@@ -428,24 +586,24 @@ impl MapGrid {
                     height.push(0.0);
                     continue;
                 };
-                let slot = src.decode(&mut art, e) as u32;
+                let slot = slot_of(e) as u32;
                 // Black padding metatiles are not scenery, they are the void
                 // the game hides off the edge of a 240x160 screen.
-                if art.dark[slot as usize] {
+                if art.borrow().dark[slot as usize] {
                     cells.push(Cell::Void);
                     slots.push(slot);
                     height.push(0.0);
                     continue;
                 }
-                let cell = if solid(gx, gy) {
-                    Self::classify_volume(gx, gy, &solid, &entry)
-                } else if is_water(e) {
-                    Cell::Water
-                } else {
-                    match behavior(e) {
+                let cell = match kind(gx, gy) {
+                    Kind::Plant => Self::plant(gx, gy, &kind, &entry),
+                    Kind::Thin => Cell::Bill { rows: 1 },
+                    Kind::Struct => Self::structure(gx, gy, &kind, &entry),
+                    Kind::Open if is_water(e) => Cell::Water,
+                    Kind::Open => match behavior(e) {
                         0x02 | 0x03 => Cell::Grass,
                         _ => Cell::Flat,
-                    }
+                    },
                 };
                 height.push(match cell {
                     Cell::Water => WATER,
@@ -454,6 +612,52 @@ impl MapGrid {
                 });
                 cells.push(cell);
                 slots.push(slot);
+            }
+        }
+        // Whatever the player is standing on is never a volume: FireRed lets
+        // him stand in a doorway or on a warp mat, and extruding that cell
+        // wrapped him in a box. His own cell is always floor.
+        let (pcx, pcy) = (px - gx0, py - gy0);
+        if (0..Self::COLS as i32).contains(&pcx) && (0..Self::ROWS as i32).contains(&pcy) {
+            let i = pcy as usize * Self::COLS + pcx as usize;
+            if cells[i] != Cell::Void {
+                cells[i] = Cell::Flat;
+                height[i] = 0.0;
+            }
+        }
+        let art = art.into_inner();
+        if std::env::var("GBA_3D_CELLS").is_ok() {
+            let mut seen: Vec<u16> = Vec::new();
+            for cy in 0..Self::ROWS as i32 {
+                let mut line = String::new();
+                for cx in 0..Self::COLS as i32 {
+                    let (gx, gy) = (gx0 + cx, gy0 + cy);
+                    match entry(gx, gy) {
+                        Some(e) => {
+                            let id = e & 0x3FF;
+                            if !seen.contains(&id) {
+                                seen.push(id);
+                            }
+                            line += &format!("{id:03X}{} ", if solid(gx, gy) { "*" } else { " " });
+                        }
+                        None => line += ".... ",
+                    }
+                }
+                eprintln!("row {cy:2} {line}");
+            }
+            for id in seen {
+                let s = art.slot[(id & 0x3FF) as usize];
+                if s >= 0 {
+                    let s = s as usize;
+                    eprintln!(
+                        "tile {id:03X} attr={:08X} beh={:03X} cover={:.2} ymax={} dark={}",
+                        attrs(id),
+                        behavior(id),
+                        art.cover[s],
+                        art.ymax[s],
+                        art.dark[s]
+                    );
+                }
             }
         }
         Some(MapGrid {
@@ -467,54 +671,83 @@ impl MapGrid {
         })
     }
 
-    /// Decide what solid volume the cell at (gx, gy) belongs to, purely from
+    /// Which billboard a plant cell belongs to.
+    ///
+    /// Top-down tree art stacks a canopy over a trunk, and a tree BORDER
+    /// repeats that stack down the column. So we find the column's run of
+    /// plant cells, find the shortest repeat in it, and make each repeat one
+    /// object: a two-cell tree border becomes a row of discrete trees rather
+    /// than one continuous hedge, while a single four-cell tree stays one
+    /// four-cell tree. The object's southernmost cell carries the billboard.
+    fn plant(
+        gx: i32,
+        gy: i32,
+        kind: &impl Fn(i32, i32) -> Kind,
+        entry: &impl Fn(i32, i32) -> Option<u16>,
+    ) -> Cell {
+        const MAX: i32 = 12;
+        let mut top = gy;
+        while gy - top < MAX && kind(gx, top - 1) == Kind::Plant {
+            top -= 1;
+        }
+        let mut bot = gy;
+        while bot - gy < MAX && kind(gx, bot + 1) == Kind::Plant {
+            bot += 1;
+        }
+        let len = (bot - top + 1) as usize;
+        let j = (gy - top) as usize;
+        let id = |i: usize| entry(gx, top + i as i32).unwrap_or(0) & 0x3FF;
+        let mut p = len;
+        for q in 1..len.min(5) {
+            if (0..len - q).all(|i| id(i) == id(i + q)) {
+                p = q;
+                break;
+            }
+        }
+        let group = j / p;
+        let south = ((group + 1) * p - 1).min(len - 1);
+        if j == south {
+            Cell::Bill { rows: (south - group * p + 1) as u8 }
+        } else {
+            Cell::Bill { rows: 0 }
+        }
+    }
+
+    /// Decide what built volume the cell at (gx, gy) belongs to, purely from
     /// map data, so the answer is the same on every frame no matter where the
     /// cell sits on screen.
     ///
-    /// A vertical run of solid cells in top-down art is one object seen from
+    /// A vertical run of built cells in top-down art is one object seen from
     /// above: its southern rows are the front the player sees (a house wall
-    /// with a door, a tree trunk) and its northern rows are the roof. We split
-    /// the run accordingly:
-    ///   * a run of one cell is a prop (signpost, mailbox) and stays flat;
-    ///   * a run of identical metatiles is a repeating row (a hedge, a cliff
-    ///     face), so every cell is its own one-step block wearing its own art;
-    ///   * a run that repeats with period two is trees: canopy over trunk, so
-    ///     each pair is a block one step tall with the trunk as its front;
+    /// with a door) and its northern rows are the roof. We split the run
+    /// accordingly:
+    ///   * a run of one cell is a lone object and stands up as a billboard;
+    ///   * a run of identical metatiles is a repeating row (a cliff face), so
+    ///     every cell is its own one-step block wearing its own art;
     ///   * anything else is one object, its bottom rows (up to two) the front,
     ///     the rest the roof.
-    fn classify_volume(
+    fn structure(
         gx: i32,
         gy: i32,
-        solid: &impl Fn(i32, i32) -> bool,
+        kind: &impl Fn(i32, i32) -> Kind,
         entry: &impl Fn(i32, i32) -> Option<u16>,
     ) -> Cell {
         const MAX: i32 = 8;
         let mut top = gy;
-        while gy - top < MAX && solid(gx, top - 1) {
+        while gy - top < MAX && kind(gx, top - 1) == Kind::Struct {
             top -= 1;
         }
         let mut bot = gy;
-        while bot - gy < MAX && solid(gx, bot + 1) {
+        while bot - gy < MAX && kind(gx, bot + 1) == Kind::Struct {
             bot += 1;
         }
         let len = (bot - top + 1) as usize;
         let j = (gy - top) as usize; // index from the run's north end
         let id = |i: usize| entry(gx, top + i as i32).unwrap_or(0) & 0x3FF;
         if len == 1 {
-            return Cell::Prop;
+            return Cell::Bill { rows: 1 };
         }
-        let period = |p: usize| len > p && (0..len - p).all(|i| id(i) == id(i + p));
-        if period(1) {
-            return Cell::Block { h: STEP, n: 1, k: 0, wall: 0 };
-        }
-        if period(2) {
-            // Pairs anchored at the run's north end: canopy, trunk, canopy...
-            let k = (j % 2) as u8;
-            // A trailing odd cell has no partner; treat it as its own block.
-            let paired = j / 2 * 2 + 1 < len;
-            if paired {
-                return Cell::Block { h: STEP, n: 2, k, wall: 1 };
-            }
+        if (0..len - 1).all(|i| id(i) == id(i + 1)) {
             return Cell::Block { h: STEP, n: 1, k: 0, wall: 0 };
         }
         let wall = (len - 1).min(2) as u8;
@@ -675,9 +908,12 @@ impl Renderer {
                     let c = sample(u, v);
                     if c != SKIP {
                         if ghost {
-                            // Translucent silhouette: blend toward the scene.
+                            // Translucent silhouette: mostly the figure, so a
+                            // building standing between him and the camera
+                            // reads as glass rather than as a box he is
+                            // trapped inside.
                             let mix = |s: u32, a: u32| {
-                                (((a >> s & 0xFF) + (self.buffer[i] >> s & 0xFF) * 2) / 3) << s
+                                (((a >> s & 0xFF) * 3 + (self.buffer[i] >> s & 0xFF)) / 4) << s
                             };
                             self.buffer[i] = mix(16, c) | mix(8, c) | mix(0, c);
                         } else {
@@ -782,6 +1018,55 @@ impl Renderer {
                 let h = g.height[i];
                 let slot = g.slots[i] as usize;
 
+                // Scenery stands up. The ground under it is drawn from the
+                // metatile's BOTTOM layer only, so a fence is not also painted
+                // flat on the floor underneath itself (which read as the fence
+                // hovering over its own shadow).
+                if let Cell::Bill { rows } = cell {
+                    let ground =
+                        [project(x0, 0.0, zn), project(x1, 0.0, zn), project(x1, 0.0, zs), project(x0, 0.0, zs)];
+                    self.quad_uv(ground, &mut |u, v| {
+                        g.art.bot_at(
+                            slot,
+                            (u * 16.0).clamp(0.0, 15.0) as usize,
+                            (v * 16.0).clamp(0.0, 15.0) as usize,
+                        )
+                    });
+                    if rows == 0 {
+                        continue; // a billboard further south covers this cell
+                    }
+                    let r = rows as i32;
+                    // Stand the art on the ground by its lowest DRAWN row, not
+                    // by the tile edge: fence art sits in the upper part of its
+                    // tile, and hanging that from the tile edge left the fence
+                    // floating above the grass.
+                    let pad = if g.art.cover[slot] > 0.05 {
+                        (15 - g.art.ymax[slot].max(0)) as f32
+                    } else {
+                        0.0
+                    };
+                    let hgt = (r * 16) as f32 - pad;
+                    let (uy, uz) = (COS_P, SIN_P);
+                    let q = [
+                        project(x0, hgt * uy, zs + hgt * uz),
+                        project(x1, hgt * uy, zs + hgt * uz),
+                        project(x1, 0.0, zs),
+                        project(x0, 0.0, zs),
+                    ];
+                    let n0 = cy - r + 1;
+                    self.quad_uv(q, &mut |u, v| {
+                        let gv = v.clamp(0.0, 0.999) * hgt;
+                        let sc = (gv as i32 / 16).min(r - 1);
+                        let src = g.slot_at(cx, n0 + sc, slot);
+                        g.art.object_at(
+                            src,
+                            (u * 16.0).clamp(0.0, 15.0) as usize,
+                            (gv - (sc * 16) as f32).clamp(0.0, 15.0) as usize,
+                        )
+                    });
+                    continue;
+                }
+
                 // Top face. For a volume the roof art is whatever of the
                 // object's rows is not spent on its front, stretched over the
                 // whole footprint; for ground it is simply the cell's art.
@@ -807,26 +1092,6 @@ impl Renderer {
                     )
                 });
 
-                // A one-cell prop stands as a flat billboard of its top layer,
-                // leaning back by the camera pitch like a sprite does. This is
-                // the whole reason signposts stopped being little cubes.
-                if cell == Cell::Prop {
-                    let (uy, uz) = (COS_P, SIN_P);
-                    let q = [
-                        project(x0, STEP * uy, zs + STEP * uz),
-                        project(x1, STEP * uy, zs + STEP * uz),
-                        project(x1, 0.0, zs),
-                        project(x0, 0.0, zs),
-                    ];
-                    self.quad_uv(q, &mut |u, v| {
-                        g.art.top_at(
-                            slot,
-                            (u * 16.0).clamp(0.0, 15.0) as usize,
-                            (v * 16.0).clamp(0.0, 15.0) as usize,
-                        )
-                    });
-                    continue;
-                }
                 if self.no_walls {
                     continue;
                 }
@@ -977,11 +1242,20 @@ impl Renderer {
             let (uy, uz) = (COS_P, SIN_P);
             let (wx0, _, wz0) = world(min_x, feet, 0.0);
             let wx1 = wx0 + (max_x - min_x);
+            // A sprite is drawn ON the ground it stands on, and beside the
+            // wall it stands against; both are at the same depth, so without a
+            // bias toward the camera the figure loses the depth test in places
+            // and the scenery eats bites out of him.
+            const BIAS: f32 = 6.0;
+            let lean = |x: f32, h: f32| {
+                let (a, b, c) = project(x, ground + h * uy, wz0 + h * uz);
+                (a, b, c - BIAS)
+            };
             let q = [
-                project(wx0, ground + hart * uy, wz0 + hart * uz),
-                project(wx1, ground + hart * uy, wz0 + hart * uz),
-                project(wx1, ground, wz0),
-                project(wx0, ground, wz0),
+                lean(wx0, hart),
+                lean(wx1, hart),
+                lean(wx1, 0.0),
+                lean(wx0, 0.0),
             ];
             let (bw, bh) = (max_x - min_x, hart);
             let mut sampler = |u: f32, v: f32| {
