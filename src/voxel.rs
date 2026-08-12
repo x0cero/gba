@@ -32,9 +32,51 @@ const H_GRASS: f32 = 1.5; // BG3 tiles that are dominantly green: tall grass
 /// Terrain height is clamped to 2 units per map pixel of distance from the
 /// frame edge, so scenery scrolling in grows out of the ground instead of
 /// popping in as a bare wall slab.
-const EDGE_RAMP: f32 = 2.0;
+/// GBA_EDGE overrides it; a large value effectively turns the ramp off, which
+/// is the knob for the "buildings twitch while walking" problem: the ramp is
+/// screen-space, so scenery changes height as it scrolls toward the middle.
+fn edge_ramp() -> f32 {
+    std::env::var("GBA_EDGE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2.0)
+}
 const BACKGROUND_TOP: u32 = 0x0016203A;
 const BACKGROUND_BOT: u32 = 0x00060A14;
+
+/// Color for a face the art never drew. Averaging the block's own top texels
+/// over the whole face run gives one flat material color: a real model's side
+/// is painted, not printed, and sampling per-column would just stretch the top
+/// texture's pattern into vertical stripes.
+fn paint(tex: &[u32], cap: &Capture, idx: impl Iterator<Item = usize>) -> u32 {
+    let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
+    let (mut fr, mut fg, mut fb, mut fn_) = (0u32, 0u32, 0u32, 0u32);
+    for i in idx {
+        // Cut-out texels are the black surround. Averaging them in is what
+        // turns a wall at the edge of a room into a black slab, so they only
+        // count if the run has nothing else.
+        let (c, cut) = if tex[i] == SKIP { (cap.bg_frame[i], true) } else { (tex[i], false) };
+        let (cr, cg, cb) = (c >> 16 & 0xFF, c >> 8 & 0xFF, c & 0xFF);
+        if cut {
+            fr += cr;
+            fg += cg;
+            fb += cb;
+            fn_ += 1;
+        } else {
+            r += cr;
+            g += cg;
+            b += cb;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        (r, g, b, n) = (fr, fg, fb, fn_);
+    }
+    if n == 0 {
+        return 0;
+    }
+    (r / n) << 16 | (g / n) << 8 | (b / n)
+}
 
 #[inline]
 fn shade(color: u32, f: f32) -> u32 {
@@ -64,7 +106,15 @@ pub enum Cell {
     Flat,
     Grass, // MB_TALL_GRASS etc: a walk-through overlay, never geometry
     Water, // flat, slightly sunken so shorelines get a lip
-    Block(f32, u8, u8), // blocked volume: (height, rows above, column rows)
+    /// Border filler outside the real map: never geometry, never drawn. The
+    /// game hides it off the edge of a 240x160 screen; a diorama would show
+    /// it as a black floor slab.
+    Void,
+    /// Blocked volume: (height, rows above, column rows, art has a drawn
+    /// front). The last flag is false when the column is too short for the
+    /// roof budget to leave the wall its own rows, i.e. folding the art onto
+    /// the south face would just repeat the top face.
+    Block(f32, u8, u8, bool),
 }
 
 /// The visible portion of FireRed's live map grid, read straight from
@@ -104,6 +154,12 @@ impl MapGrid {
         if !(1..=1024).contains(&vwidth) || !(1..=1024).contains(&vheight) || grid_ptr >> 24 != 2 {
             return None;
         }
+        // The live grid carries a 7-cell border on each side, so the real map
+        // is (vwidth - 15) x (vheight - 15). Anything outside that is filler.
+        if vwidth <= 15 || vheight <= 15 {
+            return None;
+        }
+        let (mw, mh) = (vwidth - 15, vheight - 15);
         let sb1 = rd32(0x0300_5008)?;
         if sb1 >> 24 != 2 {
             return None;
@@ -147,8 +203,12 @@ impl MapGrid {
         for cy in 0..Self::ROWS as i32 {
             for cx in 0..Self::COLS as i32 {
                 let (gx, gy) = (gx0 + cx, gy0 + cy);
+                if gx < 0 || gy < 0 || gx >= mw || gy >= mh {
+                    cells.push(Cell::Void);
+                    continue;
+                }
                 let Some(e) = entry(gx, gy) else {
-                    cells.push(Cell::Flat);
+                    cells.push(Cell::Void);
                     continue;
                 };
                 if e >> 10 & 3 != 0 {
@@ -177,17 +237,28 @@ impl MapGrid {
                     while below < 5 && blocked(gx, gy + below as i32 + 1) {
                         below += 1;
                     }
-                    let (h, t, r) = if period(1) {
-                        (16.0, 0u8, 1u8)
+                    // `facade`: whether the roof budget (r*16 - h, floored at
+                    // 16) leaves the south wall rows the top face does not
+                    // already wear. Periodic columns repeat vertically so
+                    // reusing rows is correct by construction; a lone prop or
+                    // a two-metatile object has no drawn front at all, and
+                    // folding it would smear its own top over its face.
+                    let (h, t, r, facade) = if period(1) {
+                        (16.0, 0u8, 1u8, true)
                     } else if period(2) {
-                        (32.0, (above % 2) as u8, 2)
+                        (32.0, (above % 2) as u8, 2, true)
                     } else if above + below == 0 {
-                        (10.0, 0, 1) // lone prop: mailbox, sign, fence piece
+                        (10.0, 0, 1, false) // lone prop: mailbox, sign, table
                     } else {
                         let total = (above + below + 1).min(6);
-                        ((total.min(2) * 16) as f32, above.min(5) as u8, total as u8)
+                        (
+                            (total.min(2) * 16) as f32,
+                            above.min(5) as u8,
+                            total as u8,
+                            total >= 3,
+                        )
                     };
-                    cells.push(Cell::Block(h, t, r));
+                    cells.push(Cell::Block(h, t, r, facade));
                 } else {
                     let b = behavior(e);
                     cells.push(match b {
@@ -214,8 +285,17 @@ pub struct Renderer {
     /// Per-map-pixel color for terrain TOP faces: normally the drawn frame,
     /// but block cells wear their column crown's art (roof rows) on top.
     top_tex: Vec<u32>,
+    /// Per-map-pixel: this block's art contains a real drawn front, so the
+    /// south wall may wear it. False faces get flat painted shading instead.
+    facade: Vec<bool>,
     /// Tilt-shift level 0-3 from GBA_TILT (default 2; 0 = off).
     tilt: u32,
+    /// GBA_3D_GUESS: build geometry from art colors when the map grid cannot
+    /// be read, instead of falling back to the flat 2D picture.
+    guess: bool,
+    /// Last known state of the map-grid read, so the fallback logs once on
+    /// each transition instead of every frame.
+    grid_ok: bool,
 }
 
 impl Renderer {
@@ -238,12 +318,15 @@ impl Renderer {
             zbuf: vec![f32::INFINITY; WIDTH * HEIGHT],
             height: vec![0.0; ppu::WIDTH * ppu::HEIGHT],
             top_tex: vec![0; ppu::WIDTH * ppu::HEIGHT],
+            facade: vec![false; ppu::WIDTH * ppu::HEIGHT],
             background,
             tilt: std::env::var("GBA_TILT")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2)
                 .min(3),
+            guess: std::env::var("GBA_3D_GUESS").is_ok(),
+            grid_ok: true,
         }
     }
 
@@ -273,6 +356,11 @@ impl Renderer {
                 let i = y * WIDTH + x;
                 if z < self.zbuf[i] {
                     match dim {
+                        // Shadows land on geometry only: an untouched depth
+                        // slot is exposed background, and darkening the sky
+                        // under a figure standing at a map edge reads as a
+                        // smudge floating in the void.
+                        Some(_) if !self.zbuf[i].is_finite() => {}
                         Some(f) => self.buffer[i] = shade(self.buffer[i], f),
                         None => {
                             self.zbuf[i] = z;
@@ -404,8 +492,16 @@ impl Renderer {
                 let i = base + sx as usize;
                 if z < self.zbuf[i] {
                     let u = ((sx as f32 + 0.5 - xl) * du) as usize;
+                    // SKIP marks a texel the game never drew (map border /
+                    // backdrop). Write neither color nor depth so the
+                    // background shows through and the diorama's silhouette
+                    // is the shape of the real world, not a black slab.
+                    let c = row[px0 + u.min(n - 1)];
+                    if c == SKIP {
+                        continue;
+                    }
                     self.zbuf[i] = z;
-                    self.buffer[i] = row[px0 + u.min(n - 1)];
+                    self.buffer[i] = c;
                 }
             }
         }
@@ -416,6 +512,26 @@ impl Renderer {
     /// shoreline lip, collision volumes take their measured height. The
     /// screen-edge ramp keeps scenery growing out of the ground.
     fn build_heights_from_grid(&mut self, grid: &MapGrid, cap: &Capture) {
+        let ramp = edge_ramp();
+        // Whole-cell blackness. FireRed fills the space around an interior
+        // with black metatiles that are inside the map and drawn by a real BG
+        // layer, so neither the backdrop flag nor the map bounds catch them.
+        // Testing a whole 16x16 cell (not a pixel) keeps black outlines and
+        // dark furniture intact: only a cell with nothing but black in it is
+        // surround.
+        let mut cell_lit = [0u32; MapGrid::COLS * MapGrid::ROWS];
+        let mut cell_all = [0u32; MapGrid::COLS * MapGrid::ROWS];
+        for py in 0..ppu::HEIGHT {
+            let cy = ((py + grid.fine.1) / 16).min(MapGrid::ROWS - 1);
+            for px in 0..ppu::WIDTH {
+                let cx = ((px + grid.fine.0) / 16).min(MapGrid::COLS - 1);
+                let c = cap.bg_frame[py * ppu::WIDTH + px];
+                cell_all[cy * MapGrid::COLS + cx] += 1;
+                if (c >> 16 & 0xFF).max(c >> 8 & 0xFF).max(c & 0xFF) > 24 {
+                    cell_lit[cy * MapGrid::COLS + cx] += 1;
+                }
+            }
+        }
         for py in 0..ppu::HEIGHT {
             let cy = ((py + grid.fine.1) / 16).min(MapGrid::ROWS - 1);
             // Ramp only the top and side edges: the bottom (near) edge reads
@@ -424,13 +540,33 @@ impl Renderer {
             for px in 0..ppu::WIDTH {
                 let cx = ((px + grid.fine.0) / 16).min(MapGrid::COLS - 1);
                 let i = py * ppu::WIDTH + px;
-                let (h, t, r) = match grid.cells[cy * MapGrid::COLS + cx] {
-                    Cell::Flat | Cell::Grass => (0.0, 0, 1),
-                    Cell::Water => (-3.0, 0, 1),
-                    Cell::Block(h, t, r) => (h, t as usize, r.max(1) as usize),
+                let cell = grid.cells[cy * MapGrid::COLS + cx];
+                let (h, t, r, facade) = match cell {
+                    Cell::Flat | Cell::Grass | Cell::Void => (0.0, 0, 1, false),
+                    Cell::Water => (-3.0, 0, 1, false),
+                    Cell::Block(h, t, r, f) => (h, t as usize, r.max(1) as usize, f),
                 };
                 let edge = edge_y.min(px.min(ppu::WIDTH - 1 - px) as f32);
-                self.height[i] = h.min((edge + 1.0) * EDGE_RAMP);
+                self.height[i] = h.min((edge + 1.0) * ramp);
+                self.facade[i] = facade;
+                // Nothing drawn here (backdrop won), or border filler showing
+                // through as black: cut the cell out of the diorama instead of
+                // laying a black floor tile. Both tests are needed -- a border
+                // block painted by a real BG layer defeats the first, and an
+                // in-map gap defeats the second.
+                // A cell that is mostly black is surround, and its few lit
+                // pixels (a doorway mat, a lamp) stay: cull only the black
+                // ones, so the mat is not left sitting on a black slab.
+                let ci = cy * MapGrid::COLS + cx;
+                let mostly_black =
+                    cell_lit[ci] * 4 < cell_all[ci] || matches!(cell, Cell::Void);
+                let c = cap.bg_frame[i];
+                let dark = (c >> 16 & 0xFF).max(c >> 8 & 0xFF).max(c & 0xFF) <= 24;
+                if cap.bg_layer[i] == 4 || (mostly_black && dark) {
+                    self.height[i] = 0.0;
+                    self.top_tex[i] = SKIP;
+                    continue;
+                }
                 // Fold: the bottom `h` pixels of the column's drawing are on
                 // the south wall; the top face wears what remains (the roof
                 // rows), stretched over the whole footprint. Fully folded
@@ -459,20 +595,37 @@ impl Renderer {
     /// down near the frame edges so scenery scrolling in grows out of the
     /// ground instead of popping in as a bare side wall.
     fn build_heights(&mut self, cap: &Capture) {
+        let ramp = edge_ramp();
         self.top_tex.copy_from_slice(&cap.bg_frame);
+        // No map grid on this path, so the backdrop flag is the only void
+        // signal available.
+        for i in 0..self.top_tex.len() {
+            if cap.bg_layer[i] == 4 {
+                self.top_tex[i] = SKIP;
+            }
+        }
         let (hofs, vofs) = cap.scroll;
         let (ox, oy) = (-((hofs % 16) as i32), -((vofs % 16) as i32));
         let (tw, th) = (ppu::WIDTH.div_ceil(16) + 1, ppu::HEIGHT.div_ceil(16) + 1);
         let mut tiles = vec![0.0f32; tw * th];
         let mut green = vec![false; tw * th];
+        // Same whole-tile blackness test the grid path uses: a tile with
+        // nothing but black in it is surround, not floor.
+        let mut black = vec![false; tw * th];
         for ty in 0..th {
             for tx in 0..tw {
                 let (x0, y0) = (ox + tx as i32 * 16, oy + ty as i32 * 16);
                 let (mut n_over, mut n_prop) = (0u32, 0u32);
                 let (mut rs, mut gs) = (0u32, 0u32);
+                let (mut lit, mut all) = (0u32, 0u32);
                 for y in y0.max(0)..(y0 + 16).min(ppu::HEIGHT as i32) {
                     for x in x0.max(0)..(x0 + 16).min(ppu::WIDTH as i32) {
                         let i = y as usize * ppu::WIDTH + x as usize;
+                        let c = cap.bg_frame[i];
+                        all += 1;
+                        if (c >> 16 & 0xFF).max(c >> 8 & 0xFF).max(c & 0xFF) > 24 {
+                            lit += 1;
+                        }
                         match cap.bg_layer[i] {
                             1 => n_over += 1,
                             3 => {
@@ -485,6 +638,7 @@ impl Renderer {
                     }
                 }
                 let ti = ty * tw + tx;
+                black[ti] = all > 0 && lit * 4 < all;
                 if n_over >= 40 && n_over >= n_prop {
                     tiles[ti] = H_OVERLAY;
                 } else if n_prop >= 40 {
@@ -511,8 +665,16 @@ impl Renderer {
             for px in 0..ppu::WIDTH {
                 let tx = ((px as i32 - ox) / 16) as usize;
                 let edge = edge_y.min(px.min(ppu::WIDTH - 1 - px) as f32);
-                self.height[py * ppu::WIDTH + px] =
-                    tiles[ty * tw + tx].min((edge + 1.0) * EDGE_RAMP);
+                let i = py * ppu::WIDTH + px;
+                self.height[i] = tiles[ty * tw + tx].min((edge + 1.0) * ramp);
+                // BG1 houses and canopies keep the fold; BG3 fences, signs
+                // and grass have no drawn front.
+                self.facade[i] = tiles[ty * tw + tx] == H_OVERLAY;
+                let c = cap.bg_frame[i];
+                if black[ty * tw + tx] && (c >> 16 & 0xFF).max(c >> 8 & 0xFF).max(c & 0xFF) <= 24 {
+                    self.height[i] = 0.0;
+                    self.top_tex[i] = SKIP;
+                }
             }
         }
     }
@@ -550,6 +712,23 @@ impl Renderer {
         if cap.fallback_2d || ui_pixels > ppu::WIDTH * ppu::HEIGHT / 2 {
             self.blit_2d(flat, false);
             return;
+        }
+        // No live map grid means this is not an overworld: a battle, a
+        // cutscene, the intro. Guessing geometry from art colors there builds
+        // a diorama out of a battle backdrop and rips the sprites apart, so
+        // show the real 2D picture instead. GBA_3D_GUESS=1 restores the old
+        // color classifier.
+        if grid.is_none() && !self.guess {
+            if self.grid_ok {
+                self.grid_ok = false;
+                eprintln!("3d: no map grid, showing 2D");
+            }
+            self.blit_2d(flat, false);
+            return;
+        }
+        if grid.is_some() && !self.grid_ok {
+            self.grid_ok = true;
+            eprintln!("3d: map grid back");
         }
         match grid {
             Some(g) => self.build_heights_from_grid(g, cap),
@@ -603,24 +782,34 @@ impl Renderer {
         // Take the heightfield out of self so the raster methods can borrow
         // self mutably while we read it.
         let height = std::mem::take(&mut self.height);
+        let tex = std::mem::take(&mut self.top_tex);
         let hgt = |x: usize, y: usize| height[y * W + x];
+        // A cut-out cell has no geometry, so it must not grow a face of its
+        // own, and a neighbour reads it as open ground rather than as a wall.
+        let void = |x: usize, y: usize| tex[y * W + x] == SKIP;
+        let hgt_or_ground = |x: usize, y: usize| if void(x, y) { 0.0 } else { hgt(x, y) };
         // South-facing walls (toward the camera), merged along x.
         for py in 0..H {
             let mut px0 = 0;
             while px0 < W {
+                if void(px0, py) {
+                    px0 += 1;
+                    continue;
+                }
                 let h = hgt(px0, py);
                 // Below the screen's bottom row lies the diorama's cut
                 // plane: draw the face so cut buildings show a cross
                 // section instead of a floating slab.
-                let hs = if py + 1 < H { hgt(px0, py + 1) } else { 0.0 };
+                let hs = if py + 1 < H { hgt_or_ground(px0, py + 1) } else { 0.0 };
                 if hs >= h {
                     px0 += 1;
                     continue;
                 }
                 let mut px1 = px0 + 1;
                 while px1 < W
+                    && !void(px1, py)
                     && hgt(px1, py) == h
-                    && (if py + 1 < H { hgt(px1, py + 1) } else { 0.0 }) == hs
+                    && (if py + 1 < H { hgt_or_ground(px1, py + 1) } else { 0.0 }) == hs
                 {
                     px1 += 1;
                 }
@@ -633,12 +822,32 @@ impl Renderer {
                     project(ax, hs, az),
                 ];
                 let (n, dh) = ((px1 - px0) as f32, h - hs);
+                // Only fold real drawn art down the face. Without a facade
+                // the fold would just repeat the top texture (a table wearing
+                // its own tablecloth down its front), so those faces get a
+                // flat painted side, darkened toward the floor.
+                let has_facade = self.facade[py * W + px0];
+                // No drawn front exists: paint the whole run one color from
+                // the block's own top, darkened toward the floor.
+                let flat = (!has_facade)
+                    .then(|| paint(&tex, cap, (px0..px1).map(|c| py * W + c)))
+                    .unwrap_or(0);
                 self.quad_uv(q, &mut |u: f32, v: f32| {
                     let col = px0 + ((u * n) as usize).min(px1 - px0 - 1);
+                    let vv = v.clamp(0.0, 1.0);
+                    if !has_facade {
+                        return shade(flat, 0.72 * (1.0 - 0.30 * vv));
+                    }
                     // Fold the art upright: the drawing's bottom row lands
                     // at the wall's bottom, not mirrored.
-                    let row = py.saturating_sub(((1.0 - v.clamp(0.0, 1.0)) * (dh - 1.0)) as usize);
-                    shade(cap.bg_frame[row * W + col], 0.55)
+                    let row = py.saturating_sub(((1.0 - vv) * (dh - 1.0)) as usize);
+                    // A fold that walks up past the top of the drawing lands
+                    // in the backdrop; fall back to the block's own row.
+                    let mut s = row * W + col;
+                    if cap.bg_layer[s] == 4 {
+                        s = py * W + col;
+                    }
+                    shade(cap.bg_frame[s], 0.55)
                 });
                 px0 = px1;
             }
@@ -648,10 +857,14 @@ impl Renderer {
             for west in [true, false] {
                 let mut py0 = 0;
                 while py0 < H {
+                    if void(px, py0) {
+                        py0 += 1;
+                        continue;
+                    }
                     let h = hgt(px, py0);
                     let hn = match west {
-                        true if px > 0 => hgt(px - 1, py0),
-                        false if px + 1 < W => hgt(px + 1, py0),
+                        true if px > 0 => hgt_or_ground(px - 1, py0),
+                        false if px + 1 < W => hgt_or_ground(px + 1, py0),
                         _ => h,
                     };
                     if hn >= h {
@@ -659,10 +872,10 @@ impl Renderer {
                         continue;
                     }
                     let mut py1 = py0 + 1;
-                    while py1 < H && hgt(px, py1) == h && {
+                    while py1 < H && !void(px, py1) && hgt(px, py1) == h && {
                         let n2 = match west {
-                            true if px > 0 => hgt(px - 1, py1),
-                            false if px + 1 < W => hgt(px + 1, py1),
+                            true if px > 0 => hgt_or_ground(px - 1, py1),
+                            false if px + 1 < W => hgt_or_ground(px + 1, py1),
                             _ => h,
                         };
                         n2 == hn
@@ -678,18 +891,27 @@ impl Renderer {
                         project(ax, hn, az1),
                         project(ax, hn, az0),
                     ];
-                    let (n, dh) = ((py1 - py0) as f32, h - hn);
-                    self.quad_uv(q, &mut |u: f32, v: f32| {
-                        let row = py0 + ((u * n) as usize).min(py1 - py0 - 1);
-                        let k = (v.max(0.0) * dh) as usize;
-                        let col = if west { (px + k).min(W - 1) } else { px.saturating_sub(k) };
-                        shade(cap.bg_frame[row * W + col], 0.42)
+                    // Side faces never fold. Top-down art contains a front
+                    // view and no side view at all, so marching sideways into
+                    // the object only smears its top texture across a face
+                    // that is supposed to be plain material. Two pixels in
+                    // from the edge stays clear of the art's dark outline.
+                    let light = if west { 0.62 } else { 0.72 };
+                    // Sample a few pixels INTO the block, not the boundary
+                    // column: the edge pixel is usually the art's outline or
+                    // the ground behind it, which paints a tree's side face
+                    // the color of the grass next to it.
+                    let src = if west { (px + 3).min(W - 1) } else { px.saturating_sub(3) };
+                    let flat = paint(&tex, cap, (py0..py1).map(|r| r * W + src));
+                    self.quad_uv(q, &mut |_u: f32, v: f32| {
+                        shade(flat, light * (1.0 - 0.30 * v.clamp(0.0, 1.0)))
                     });
                     py0 = py1;
                 }
             }
         }
         self.height = height;
+        self.top_tex = tex;
     }
 
     fn render_sprites_entry(&mut self, cap: &Capture, grid: Option<&MapGrid>) {
@@ -851,7 +1073,11 @@ impl Renderer {
             for y in 0..HEIGHT {
                 let o = strength(y);
                 let row = y * WIDTH;
-                if o < 0.05 {
+                // The widest tap is (4 * o) as i32, so below 0.25 every tap
+                // reads the same source pixel and the blur is a no-op. Skip
+                // it: identical output, and it pays for the new per-pixel
+                // tests above.
+                if o * 4.0 < 1.0 {
                     dst[row..row + WIDTH].copy_from_slice(&src[row..row + WIDTH]);
                     continue;
                 }

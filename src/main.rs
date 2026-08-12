@@ -208,6 +208,7 @@ fn main() -> ExitCode {
                                 voxel::Cell::Flat => 0,
                                 voxel::Cell::Grass => 0x0000_C000,
                                 voxel::Cell::Water => 0x0000_00C0,
+                                voxel::Cell::Void => 0x00C0_00C0,
                                 voxel::Cell::Block(h, ..) => (0x60 + h as u32 * 2).min(255) << 16,
                             };
                             let mix = |a: u32, b: u32, s: u32| {
