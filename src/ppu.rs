@@ -584,6 +584,14 @@ pub struct Capture {
     /// True when the picture is not a mode-0 overworld (intro, battles,
     /// affine scenes): the diorama renderer should fall back to flat 2D.
     pub fallback_2d: bool,
+    /// Each OAM object's box on screen as [x0, y0, x1, y1] exclusive, from the
+    /// OAM attributes alone, so it is NOT clipped to the visible frame; an
+    /// empty box means the object is disabled. `sprite_pixels` only records
+    /// what actually got drawn, so a character half off the bottom of the
+    /// screen measures as a short figure standing further north than he is,
+    /// and that measurement slides as the world scrolls under him. The
+    /// unclipped box is the fixed thing to measure against.
+    pub sprite_boxes: Vec<[i32; 4]>,
 }
 
 impl Capture {
@@ -600,6 +608,32 @@ impl Capture {
         self.bg_under.clear();
         self.bg_under.resize(WIDTH * HEIGHT, rgb555(backdrop555));
         self.sprite_pixels.clear();
+        self.sprite_boxes.clear();
+        self.sprite_boxes.resize(128, [0; 4]);
+        for i in 0..128 {
+            let a0 = u16::from_le_bytes([oam[i * 8], oam[i * 8 + 1]]) as u32;
+            let a1 = u16::from_le_bytes([oam[i * 8 + 2], oam[i * 8 + 3]]) as u32;
+            let affine = a0 & 0x100 != 0;
+            if (!affine && a0 & 0x200 != 0) || a0 >> 10 & 3 == 3 {
+                continue;
+            }
+            let (w, h): (u32, u32) = match (a0 >> 14 & 3, a1 >> 14 & 3) {
+                (0, s) => (8 << s, 8 << s),
+                (1, 0) => (16, 8),
+                (1, 1) => (32, 8),
+                (1, 2) => (32, 16),
+                (1, 3) => (64, 32),
+                (2, 0) => (8, 16),
+                (2, 1) => (8, 32),
+                (2, 2) => (16, 32),
+                _ => (32, 64),
+            };
+            let (bw, bh) = if affine && a0 & 0x200 != 0 { (w * 2, h * 2) } else { (w, h) };
+            let (sy, sx) = (a0 & 0xFF, a1 & 0x1FF);
+            let oy = if sy + bh > 256 { sy as i32 - 256 } else { sy as i32 };
+            let ox = if sx + bw > 512 { sx as i32 - 512 } else { sx as i32 };
+            self.sprite_boxes[i] = [ox, oy, ox + bw as i32, oy + bh as i32];
+        }
         self.ui_frame.clear();
         self.ui_frame.resize(WIDTH * HEIGHT, 0);
         self.scroll = (r16(0x18) & 0x1FF, r16(0x1A) & 0x1FF);

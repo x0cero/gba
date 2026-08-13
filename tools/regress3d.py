@@ -61,6 +61,14 @@ INSIDE = (2600, 2700)
 # floor under this figure" only makes sense once a map has settled.
 SETTLE = 24
 
+# Walks the player right up against a stationary Pallet Town NPC and stands
+# there, so a second character's sprite sits one cell (sixteen screen pixels)
+# from his own. That is the arrangement that used to make the NPC count as the
+# player, get pinned to the camera instead of to the map, and slide along with
+# every step: the "NPCs follow me like a mirage" report.
+NPC = ("1520-1555:left,1570-1680:down,1700-1800:left,1810-1930:down,"
+       "1950-2060:left,2080-2200:down")
+
 # Opens the START menu and walks into the trainer card, a full-screen menu
 # that replaces the overworld while gBackupMapLayout still points at a
 # perfectly valid Pallet Town.
@@ -69,12 +77,15 @@ MENU_OPEN = (1790, 1900)
 
 
 class Frame:
-    __slots__ = ("n", "cam", "fine", "player", "figs", "sha", "geom", "mapsize")
+    __slots__ = ("n", "cam", "fine", "player", "figs", "sha", "geom",
+                 "mapsize", "seen", "hide")
 
     def __init__(self, n):
         self.n = n
         self.cam = self.fine = self.player = self.sha = self.mapsize = None
         self.figs = []
+        self.seen = set()
+        self.hide = []
         self.geom = {}
 
 
@@ -123,14 +134,22 @@ def parse(text):
                 r"anchor (-?\d+) (-?\d+) cell (-?\d+) (-?\d+) ground (\S+) "
                 r"wz (\S+) gamecell (-?\d+) (-?\d+) player (\d) void (\d)",
                 line)
-            if m:
+            if m and line.strip() not in cur.seen:
+                # The headless runner renders its final frame once more on the
+                # way out, so the last FRAME block carries every figure twice.
+                cur.seen.add(line.strip())
                 g = m.groups()
                 cur.figs.append(dict(
                     idx=int(g[0]), feet=float(g[3]),
+                    minx=float(g[1]), maxx=float(g[2]),
                     anchor=(int(g[6]), int(g[7])),
                     cell=(int(g[8]), int(g[9])), ground=float(g[10]),
                     wz=float(g[11]), gamecell=(int(g[12]), int(g[13])),
                     player=g[14] == "1", void=g[15] == "1"))
+        elif f[0] == "HIDE":
+            cur.hide.append(dict(idx=int(f[1]), player=f[3] == "1",
+                                 behind=f[5] == "1", cov=int(f[7]),
+                                 vis=int(f[9]), ghost=f[11] == "1"))
         elif f[0] == "SHA":
             cur.sha = f[1]
         elif f[0] == "GEOM":
@@ -271,6 +290,113 @@ def check_warps(frames):
     return bad[:5], f"{warps - 1} map changes, {len(frames)} frames"
 
 
+def check_npc(frames):
+    """Only one figure is ever the player, and every other figure stands on
+    the map rather than travelling with the camera.
+
+    The cause is checked directly: a second figure flagged as the player is
+    pinned to the camera by design, so a character in a neighbouring cell used
+    to be dragged along by every step the player took, which is the "the NPCs
+    follow me, like a mirage" report.
+
+    The symptom is checked by the one invariant a character on a tile map
+    cannot break. Characters stand on cells, and a step is a whole cell, so
+    wherever a figure comes to REST its anchor must differ from where that
+    same figure last rested by a whole number of cells. A figure being dragged
+    a pixel at a time by the camera comes to rest half way between two cells,
+    and no amount of real walking can do that.
+    """
+    RESTED = 10
+    bad, multi, near, drift, jumps = [], 0, 0, 0, 0
+    tracks = {}          # id -> [anchor, still frames, first rest anchor]
+    next_id = [0]
+    prev = {}
+    for f in frames:
+        if sum(1 for g in f.figs if g["player"]) > 1:
+            multi += 1
+            if len(bad) < 6:
+                bad.append(f"frame {f.n}: two figures claim to be the player")
+        for g in f.figs:
+            cx = (g["minx"] + g["maxx"]) / 2
+            if not g["player"] and abs(cx - 120) < 24 and abs(g["feet"] - 88) < 24:
+                near += 1
+        cur = {}
+        for g in f.figs:
+            if g["player"]:
+                continue
+            a = g["anchor"]
+            best = None
+            for t, st in prev.items():
+                d = abs(a[0] - st[0][0]) + abs(a[1] - st[0][1])
+                if d <= 24 and (best is None or d < best[0]):
+                    best = (d, t)
+            if best is None:
+                t = next_id[0]
+                next_id[0] += 1
+                tracks[t] = [a, 1, None]
+            else:
+                t = best[1]
+                st = tracks[t]
+                if max(abs(a[0] - st[0][0]), abs(a[1] - st[0][1])) > 2:
+                    jumps += 1
+                    if len(bad) < 6:
+                        bad.append(f"frame {f.n}: figure anchor jumped from "
+                                   f"{st[0]} to {a}")
+                st[1] = st[1] + 1 if a == st[0] else 1
+                st[0] = a
+                if st[1] == RESTED:
+                    if st[2] is None:
+                        st[2] = a
+                    elif (a[0] - st[2][0]) % 16 or (a[1] - st[2][1]) % 16:
+                        drift += 1
+                        if len(bad) < 6:
+                            bad.append(
+                                f"frame {f.n}: figure came to rest at {a}, "
+                                f"which is not a whole number of cells from "
+                                f"{st[2]} where it last stood")
+                        st[2] = a
+            cur[t] = tracks[t]
+        prev = cur
+    if not near:
+        bad.append("scenario never stood an NPC beside the player, so it "
+                   "proves nothing")
+    return bad, (f"{len(frames)} frames, {near} with an NPC beside the player, "
+                 f"{len(tracks)} figure tracks, {multi} double-player, "
+                 f"{drift} off-grid rests, {jumps} jumps")
+
+
+def check_sink(frames):
+    """The player is never left half drawn behind a building.
+
+    A building is stood up off the ground, which moves its whole picture north
+    on screen, so it covers the walkable rows BEHIND it and cuts the character
+    walking along them off from the feet upwards, a little more with every
+    step -- he reads as walking down a staircase. Wherever the map says a
+    built volume stands on the rows between the player and the camera, any
+    part of him the volume hides has to come back as the silhouette.
+    """
+    bad, behind, hidden, missing = [], 0, 0, 0
+    for f in frames:
+        for h in f.hide:
+            if not h["player"] or not h["behind"]:
+                continue
+            behind += 1
+            if h["cov"] == h["vis"]:
+                continue
+            hidden += 1
+            if not h["ghost"]:
+                missing += 1
+                if len(bad) < 5:
+                    frac = (h["cov"] - h["vis"]) / max(h["cov"], 1)
+                    bad.append(f"frame {f.n}: player {frac:.0%} hidden by the "
+                               "volume in front of him, no silhouette drawn")
+    if not hidden:
+        bad.append("the player never walked behind a built volume, so this "
+                   "scenario proves nothing")
+    return bad, (f"{behind} frames behind a volume, {hidden} of them with the "
+                 f"player partly hidden, {missing} without a silhouette")
+
+
 def check_flat(frames, lo, hi, want):
     """`want` True: these frames are the overworld and must build a diorama.
     False: they are not, and must fall through to flat 2D, which shows up as
@@ -335,6 +461,11 @@ def main():
             report("walk.ground", *check_ground(fr, 1500, 1620))
         if want("bump"):
             report("bump.stable", *check_bump(fr, 1560, 1615))
+
+    if want("npc"):
+        fr = run(args.binary, args.rom, NPC, 2210)
+        report("npc.pinned", *check_npc(fr))
+        report("npc.sink", *check_sink(fr))
 
     if want("interior"):
         # One run all the way in and back out: two warps, an interior with

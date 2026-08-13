@@ -28,12 +28,35 @@ pub const HEIGHT: usize = 500;
 /// default diorama tilt).
 const SIN_P: f32 = 0.573_576_4;
 const COS_P: f32 = 0.819_152;
-/// Camera distance from the diorama center (world units = GBA pixels).
-const CAM_DIST: f32 = 340.0;
-/// Focal length in screen pixels.
-const FOCAL: f32 = 940.0;
+/// Camera distance from the diorama center and focal length, at perspective
+/// strength 1. Their RATIO is the scale at the middle of the frame, so
+/// multiplying both by the same number keeps the diorama the same size while
+/// flattening the perspective toward an orthographic view.
+const BASE_DIST: f32 = 340.0;
+const BASE_FOCAL: f32 = 940.0;
 const CX: f32 = WIDTH as f32 / 2.0;
 const CY: f32 = 236.0;
+
+/// HOW WIDE-ANGLE THE CAMERA IS (GBA_3D_PERSP, default 6).
+///
+/// At 1 the camera sat 340 world units from the diorama with a 940-pixel
+/// focal length, which is an extremely wide lens: a cell at the near edge of
+/// the frame was drawn twice the size of a cell at the far edge, so a house
+/// near the screen edge sheared into a skewed slab, roofs at the east edge
+/// leaned hard, and every billboard slid sideways as it crossed the frame.
+/// Pulling the camera back and lengthening the lens by the same factor keeps
+/// the picture the same size at the centre and flattens all of that out; the
+/// HGSS / 3dSen miniature look is a tilted near-orthographic view, not a wide
+/// angle one. 1 restores the original wide lens.
+fn camera_scale() -> (f32, f32) {
+    static K: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        let k: f32 =
+            std::env::var("GBA_3D_PERSP").ok().and_then(|v| v.parse().ok()).unwrap_or(3.0);
+        let k = k.clamp(0.5, 64.0);
+        (BASE_DIST * k, BASE_FOCAL * k)
+    })
+}
 
 const BACKGROUND_TOP: u32 = 0x0016203A;
 const BACKGROUND_BOT: u32 = 0x00060A14;
@@ -43,6 +66,17 @@ const BACKGROUND_BOT: u32 = 0x00060A14;
 /// quad.
 const SKIP: u32 = 0xFFFF_FFFF;
 
+/// Blank rows an overworld character sprite leaves at the bottom of its OAM
+/// cell. Measured, not guessed: for every unclipped figure in a Pallet Town
+/// walk the drawn feet sit exactly this far above the cell's bottom edge, and
+/// it is the one number the OAM box cannot supply for a figure whose feet are
+/// off the bottom of the screen.
+const VPAD: f32 = 1.0;
+
+/// Metatiles per row of a FRLG tileset's metatile image. A multi-metatile
+/// object's cell one row down is this many ids on.
+const META_ROW: u16 = 8;
+
 /// Height of one metatile step, in world units (= GBA pixels).
 const STEP: f32 = 16.0;
 /// Water sits below ground so shorelines get a lip.
@@ -50,7 +84,7 @@ const WATER: f32 = -3.0;
 /// How much taller than its map footprint a whole tree stands. Top-down art
 /// foreshortens a tree badly; standing the complete graphic up at 1:1 gives a
 /// squat shrub, and real dioramas stretch it a little.
-const TREE_TALL: f32 = 1.25;
+const TREE_TALL: f32 = 1.0;
 
 #[inline]
 fn rgb555(c: u16) -> u32 {
@@ -70,9 +104,10 @@ fn shade(color: u32, f: f32) -> u32 {
 /// to (screen x, screen y, view depth).
 #[inline]
 fn project(wx: f32, wy: f32, wz: f32) -> (f32, f32, f32) {
+    let (dist, focal) = camera_scale();
     let yv = wy * COS_P + wz * SIN_P;
-    let zv = CAM_DIST + wz * COS_P - wy * SIN_P;
-    (CX + FOCAL * wx / zv, CY - FOCAL * yv / zv, zv)
+    let zv = dist + wz * COS_P - wy * SIN_P;
+    (CX + focal * wx / zv, CY - focal * yv / zv, zv)
 }
 
 /// Map a capture pixel (px, py) plus height to world space: the visible GBA
@@ -870,36 +905,9 @@ impl MapGrid {
         // of a tree is not a tree. So find the repeating unit ONCE for the
         // whole window, straight from the metatile ids, and instance the whole
         // graphic per occurrence.
-        let leaf_id = |cx: i32, cy: i32| -> Option<u16> {
-            (kind_at(cx, cy) == Kind::Plant).then(|| entry(gx0 + cx, gy0 + cy).unwrap_or(0) & 0x3FF)
-        };
-        // FRLG stores a multi-metatile object's tiles CONSECUTIVELY in reading
-        // order, so a tree unit's ids run i, i+1 across a row and jump by the
-        // unit's width to the next row. That makes the unit readable straight
-        // off the ids of a cell and its neighbours, with no phase, no modular
-        // arithmetic against the window origin and no per-window search --
-        // which is what used to make the same tree border resolve differently
-        // from different camera positions, and drop most of it back to
-        // one-cell blobs.
-        //
-        // Width first: the longest run of east neighbours whose id is exactly
-        // one more, over the whole window, is the unit width (capped at 4).
-        let mut pw = 1i32;
-        for cy in 0..Self::ROWS as i32 {
-            let mut run = 1i32;
-            for cx in 0..Self::COLS as i32 {
-                match (leaf_id(cx, cy), leaf_id(cx + 1, cy)) {
-                    (Some(a), Some(b)) if b == a + 1 => {
-                        run += 1;
-                        pw = pw.max(run.min(4));
-                    }
-                    _ => run = 1,
-                }
-            }
-        }
         // The unit a plant cell belongs to: walk west while the id keeps
-        // decrementing and north while it drops by a full unit width, then
-        // measure the unit's extent the same way. Every step is a local test
+        // decrementing and north while it drops by one metatile-image row,
+        // then measure the unit's extent the same way. Every step is a local test
         // on map data, so the answer for a given map cell is the same from
         // every camera position.
         // The walk runs in MAP coordinates, not window coordinates: a unit
@@ -928,7 +936,7 @@ impl MapGrid {
             while gy - ay < 3
                 && plant_id(ax, ay - 1)
                     .zip(plant_id(ax, ay))
-                    .is_some_and(|(n, c)| n + pw as u16 == c)
+                    .is_some_and(|(n, c)| n + META_ROW == c)
             {
                 ay -= 1;
             }
@@ -944,7 +952,7 @@ impl MapGrid {
             while h < 4
                 && plant_id(ax, ay + h)
                     .zip(plant_id(ax, ay + h - 1))
-                    .is_some_and(|(s, c)| s == c + w as u16)
+                    .is_some_and(|(s, c)| s == c + META_ROW)
             {
                 h += 1;
             }
@@ -1744,14 +1752,94 @@ impl Renderer {
                 figures[r].push(i);
             }
         }
+        // The same figures measured from OAM instead of from drawn pixels:
+        // whole, unclipped, and moving with the world even when half of the
+        // character is past the edge of the 240x160 frame.
+        let mut oam_box: Vec<Option<[i32; 4]>> = vec![None; boxes.len()];
+        for (obj, &g) in group.iter().enumerate() {
+            if g == usize::MAX {
+                continue;
+            }
+            let Some(&b) = cap.sprite_boxes.get(obj) else { continue };
+            if b[2] <= b[0] {
+                continue;
+            }
+            let r = root(&mut find, g);
+            oam_box[r] = Some(match oam_box[r] {
+                None => b,
+                Some(o) => [o[0].min(b[0]), o[1].min(b[1]), o[2].max(b[2]), o[3].max(b[3])],
+            });
+        }
+        // WHICH FIGURE IS THE PLAYER: EXACTLY ONE OF THEM.
+        //
+        // The player is drawn at the middle of the screen and is anchored to
+        // the camera with a deadband, because the camera IS him. Deciding that
+        // by a threshold -- "any figure whose box is within 24 pixels of the
+        // screen centre" -- made every character standing in a NEIGHBOURING
+        // CELL the player as well, since one cell is only sixteen pixels. Such
+        // a figure was then pinned to the camera instead of to the map, so it
+        // travelled with the camera while the ground slid underneath and
+        // snapped back a cell at a time: the NPCs that "follow me, like a
+        // mirage". Only the single closest figure can be the player.
+        let mut best_player: Option<(f32, usize)> = None;
+        for (fig, pixels) in figures.iter().enumerate() {
+            if pixels.is_empty() {
+                continue;
+            }
+            let feet = pixels.iter().map(|i| i / W).max().unwrap() as f32 + 1.0;
+            let min_x = pixels.iter().map(|i| i % W).min().unwrap() as f32;
+            let max_x = pixels.iter().map(|i| i % W).max().unwrap() as f32 + 1.0;
+            let ccx = (min_x + max_x) / 2.0;
+            let (dx, dy) = ((ccx - 120.0).abs(), (feet - 88.0).abs());
+            if dx < 24.0 && dy < 24.0 {
+                let d = dx + dy;
+                if best_player.is_none_or(|(bd, _)| d < bd) {
+                    best_player = Some((d, fig));
+                }
+            }
+        }
+        let player_fig = best_player.map(|(_, f)| f);
+
         for (fig, pixels) in figures.iter().enumerate() {
             if pixels.is_empty() {
                 continue;
             }
             // Figure extents: feet = lowest pixel row.
-            let feet = pixels.iter().map(|i| i / W).max().unwrap() as f32 + 1.0;
-            let min_x = pixels.iter().map(|i| i % W).min().unwrap() as f32;
-            let max_x = pixels.iter().map(|i| i % W).max().unwrap() as f32 + 1.0;
+            let mut feet = pixels.iter().map(|i| i / W).max().unwrap() as f32 + 1.0;
+            let mut min_x = pixels.iter().map(|i| i % W).min().unwrap() as f32;
+            let mut max_x = pixels.iter().map(|i| i % W).max().unwrap() as f32 + 1.0;
+            let mut top = pixels.iter().map(|i| i / W).min().unwrap() as f32;
+            // A FIGURE HALF OFF THE SCREEN IS STILL STANDING SOMEWHERE.
+            //
+            // Every extent above is the extent of what the PPU DREW, so an
+            // edge that runs off the frame is pinned to the frame: as the
+            // world scrolls, the drawn box of a character walking off the
+            // bottom of the screen keeps its bottom row and loses its top,
+            // and the position measured from it therefore travels with the
+            // camera instead of staying on the map. That is the "NPC drifts
+            // along with me and then snaps" at the edges of the picture.
+            //
+            // The OAM box has no such problem: it is where the game put the
+            // object, clipped or not. Only the clipped edges are taken from
+            // it, and each is corrected by the padding this sprite format
+            // leaves between its cell and its drawing, measured off whichever
+            // edges of this very figure are NOT clipped.
+            if let Some(b) = oam_box[fig] {
+                let padl = if min_x > 0.0 { min_x - b[0] as f32 } else { 0.0 };
+                let padr = if max_x < W as f32 { b[2] as f32 - max_x } else { 0.0 };
+                if min_x <= 0.0 {
+                    min_x = b[0] as f32 + padr;
+                }
+                if max_x >= W as f32 {
+                    max_x = b[2] as f32 - padl;
+                }
+                if feet >= ppu::HEIGHT as f32 {
+                    feet = b[3] as f32 - VPAD;
+                }
+                if top <= 0.0 {
+                    top = b[1] as f32;
+                }
+            }
             let (ccx, cw) = ((min_x + max_x) / 2.0, (max_x - min_x) / 2.0);
             // WHERE THE FIGURE STANDS.
             //
@@ -1775,7 +1863,7 @@ impl Renderer {
             let fx = ((min_x + max_x) as usize / 2).min(W - 1);
             let (camx, camy) = mgrid.camera();
             let measured = mgrid.map_pixel(fx, feet as usize);
-            let player = (ccx - 120.0).abs() < 24.0 && (feet - 88.0).abs() < 24.0;
+            let player = player_fig == Some(fig);
             let (ax, ay) = if player {
                 // Whole cells only, and with a deadband: a character's drawn
                 // box sits about half a cell off the camera line by
@@ -1855,7 +1943,6 @@ impl Renderer {
                 self.tri([project(cxw, ground + 0.15, zc), pt(a0), pt(a1)], 0, Some(0.55));
             }
 
-            let top = pixels.iter().map(|i| i / W).min().unwrap() as f32;
             let hart = feet - top;
             // Lean-back unit vector: up tilted north by the pitch angle.
             let (uy, uz) = (COS_P, SIN_P);
@@ -1903,10 +1990,42 @@ impl Renderer {
             // fence that crosses his shins put him visibly in front of it,
             // which is exactly the "he looks like he is south of the fence"
             // report.
+            //
+            // A LIFTED ROOF IS NOT A FENCE, THOUGH, AND HALF-HIDDEN IS THE
+            // WORST CASE. Standing a building two steps off the ground moves
+            // its whole picture about forty screen pixels north, so it covers
+            // the walkable rows BEHIND it -- and a figure walking along those
+            // rows was cut off from the feet up, a little more with every step,
+            // which reads as walking down a staircase. It is not a depth bug:
+            // the roof really is nearer the camera than a figure one row north
+            // of it, because lifting a quad by h also brings it h * sin(pitch)
+            // closer. The diorama's answer to "hidden by scenery" is the
+            // silhouette, so it just has to trigger, and half of him has to
+            // vanish first only when the thing in front of him is waist high.
+            // When the map says a built volume stands on the rows between him
+            // and the camera, any occlusion at all is that volume, and the
+            // silhouette comes up immediately.
+            let behind_volume = player
+                && (1..=3).any(|d| {
+                    matches!(mgrid.cell_at_map(ax, ay - 8 + d * 16), Cell::Block { h, .. } if h > 0.0)
+                });
             let center_dist =
                 (ccx - ppu::WIDTH as f32 / 2.0).abs() + (feet - ppu::HEIGHT as f32 / 2.0).abs();
-            if center_dist < 40.0 && (self.cov - self.vis) * 2 > self.cov {
+            let hidden = self.cov - self.vis;
+            let ghost = center_dist < 40.0
+                && if behind_volume { hidden > 0 } else { hidden * 2 > self.cov };
+            if ghost {
                 self.quad_uv_ghost(q, &mut sampler);
+            }
+            if trace() {
+                println!(
+                    "HIDE {fig} player {p} behind {b} cov {c} vis {v} ghost {g}",
+                    p = player as u8,
+                    b = behind_volume as u8,
+                    c = self.cov,
+                    v = self.vis,
+                    g = ghost as u8,
+                );
             }
         }
     }
@@ -1914,20 +2033,20 @@ impl Renderer {
 
 impl MapGrid {
     /// Floor art to paint under a plant, plus how much to darken it: the
-    /// nearest cell that is real walkable ground, searched outward, shaded
-    /// like the shadow under a canopy. Deep inside a forest there is no open
-    /// cell nearby, and the answer is the darkest shade over whatever ground
-    /// layer this cell has, which reads as unlit undergrowth.
+    /// nearest cell that is real walkable ground, searched outward, with only
+    /// a hint of shade. The 2D art draws no shadow under a tree at all, and a
+    /// deep one laid a dark horizontal stripe across the bottom of every
+    /// canopy row -- the band that made the border read as shelves.
     fn floor_near(&self, cx: i32, cy: i32) -> (usize, f32) {
         for r in 1..=3i32 {
             for (dx, dy) in [(0, r), (r, 0), (-r, 0), (0, -r)] {
                 let (nx, ny) = (cx + dx, cy + dy);
                 if matches!(self.at(nx, ny), Cell::Flat | Cell::Grass) {
-                    return (self.slot_at(nx, ny, 0), 0.62);
+                    return (self.slot_at(nx, ny, 0), 0.88);
                 }
             }
         }
-        (self.slot_at(cx, cy, 0), 0.34)
+        (self.slot_at(cx, cy, 0), 0.70)
     }
 
     /// Art slot of a cell in the window, falling back to `def` outside it.
@@ -1950,11 +2069,15 @@ impl Renderer {
     /// composites over it. `level` 1-3, from GBA_TILT (default 2).
     fn tilt_shift(&mut self, level: u32) {
         // (tap spacing as fraction of height, sharp half-band, blur ramp,
-        // saturation), matching the reference presets.
+        // saturation). The sharp band is wide and the ramp long, because the
+        // tree borders that frame every outdoor map live at the very top and
+        // bottom of the picture: a narrow band blurred them into pale mounds
+        // and the saturation lift pushed them further off the 2D palette, and
+        // "the trees look like cabbages" is that, not the geometry.
         let presets = [
-            (0.0016, 0.14, 0.42, 1.10),
-            (0.0028, 0.10, 0.36, 1.18),
-            (0.0042, 0.07, 0.30, 1.28),
+            (0.0016, 0.22, 0.46, 1.06),
+            (0.0026, 0.18, 0.40, 1.12),
+            (0.0042, 0.10, 0.32, 1.22),
         ];
         let (spacing, band, range, sat) = presets[(level as usize - 1).min(2)];
         let spacing = (HEIGHT as f32 * spacing).clamp(0.75, 3.0);
