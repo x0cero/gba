@@ -69,16 +69,27 @@ SETTLE = 24
 NPC = ("1520-1555:left,1570-1680:down,1700-1800:left,1810-1930:down,"
        "1950-2060:left,2080-2200:down")
 
+# Walks to the north-west corner of Pallet Town, where Joseph plays: standing
+# left of his house with the west tree border down the side of the frame and the
+# town's north tree row behind the fence. Frame 2020 is that view.
+NW_PALLET = "1520-1600:down,1620-1900:left,1920-2000:up"
+NW_FRAME = 2020
+
 # Opens the START menu and walks into the trainer card, a full-screen menu
 # that replaces the overworld while gBackupMapLayout still points at a
 # perfectly valid Pallet Town.
 MENU = "1520-1524:start,1580-1584:down,1640-1644:a,1760-1764:a"
 MENU_OPEN = (1790, 1900)
 
+# From the north-west corner, up onto the row behind his house and then east
+# and west along it, so the lifted roof stands between him and the camera for
+# most of a hundred frames: the "sinking behind the building" walk.
+BEHIND = "2020-2040:up,2060-2260:right,2280-2300:down,2320-2560:left"
+
 
 class Frame:
     __slots__ = ("n", "cam", "fine", "player", "figs", "sha", "geom",
-                 "mapsize", "seen", "hide")
+                 "mapsize", "seen", "hide", "trees")
 
     def __init__(self, n):
         self.n = n
@@ -86,6 +97,7 @@ class Frame:
         self.figs = []
         self.seen = set()
         self.hide = []
+        self.trees = {}
         self.geom = {}
 
 
@@ -150,6 +162,8 @@ def parse(text):
             cur.hide.append(dict(idx=int(f[1]), player=f[3] == "1",
                                  behind=f[5] == "1", cov=int(f[7]),
                                  vis=int(f[9]), ghost=f[11] == "1"))
+        elif f[0] == "TREE":
+            cur.trees[(int(f[1]), int(f[2]))] = (int(f[4]), int(f[6]))
         elif f[0] == "SHA":
             cur.sha = f[1]
         elif f[0] == "GEOM":
@@ -397,6 +411,31 @@ def check_sink(frames):
                  f"player partly hidden, {missing} without a silhouette")
 
 
+def check_trees(frames, at):
+    """Every pixel a tree billboard paints is still exactly that colour in the
+    finished frame.
+
+    A tree in the diorama is the game's own metatile artwork, decoded from the
+    same ROM tables and VRAM tiles the PPU draws the 2D frame from, so a tree
+    pixel that nothing touches afterwards IS the 2D render's pixel. Anything
+    that blends over it -- the tilt-shift blur, which let neighbouring canopies
+    show through one another, or the saturation lift, which moved every canopy
+    off the game's palette -- shows up here and nowhere else.
+    """
+    win = [f for f in frames if f.n == at and f.trees]
+    if not win:
+        return [f"frame {at} drew no trees, so this proves nothing"], "n/a"
+    fr = win[-1]
+    drawn = {c: v for c, v in fr.trees.items() if v[0] > 0}
+    bad = [f"tree at map cell {c}: {v[1]} of {v[0]} pixels changed after "
+           "they were painted" for c, v in sorted(drawn.items()) if v[1]]
+    if len(drawn) < 8:
+        bad.append(f"only {len(drawn)} trees on screen at frame {at}")
+    painted = sum(v[0] for v in drawn.values())
+    return bad[:5], (f"{len(drawn)} trees, {painted} pixels, "
+                     f"{sum(v[1] for v in drawn.values())} altered")
+
+
 def check_flat(frames, lo, hi, want):
     """`want` True: these frames are the overworld and must build a diorama.
     False: they are not, and must fall through to flat 2D, which shows up as
@@ -484,6 +523,20 @@ def main():
         b = run(args.binary, args.rom, ENTER + "," + EXIT, 3000,
                 dump_from=2400)
         report("interior.determinism", *check_determinism(fr, b))
+
+    if want("trees"):
+        # His own viewpoint, not a convenient one: the west tree border and the
+        # town's north tree row, seen from where he stands in the screenshot.
+        # Pinned to GBA_3D_WALL=1, which is how he plays.
+        wall = {"GBA_3D_WALL": "1"}
+        fr = run(args.binary, args.rom, NW_PALLET, NW_FRAME,
+                 dump_from=NW_FRAME - 2, extra=wall)
+        report("trees.pixelmatch", *check_trees(fr, NW_FRAME))
+        # And the walk east along the row behind his house, where the roof
+        # covers him completely: he must never be left half drawn.
+        report("trees.sink", *check_sink(fr + run(
+            args.binary, args.rom, NW_PALLET + "," + BEHIND, 2560,
+            dump_from=2300, extra=wall)))
 
     if want("fallback"):
         # A full-screen menu leaves gBackupMapLayout and gSaveBlock1Ptr

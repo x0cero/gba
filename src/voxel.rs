@@ -1231,6 +1231,43 @@ pub struct Renderer {
     counting: bool,
     cov: u32,
     vis: u32,
+    /// Which tree unit painted each pixel (`NO_TREE` for everything else), and
+    /// the exact colour it painted there.
+    ///
+    /// TREES ARE THE ONE THING IN THE PICTURE THAT MUST STAY THE GAME'S OWN
+    /// ARTWORK. Every outdoor map is framed by them, they are the biggest
+    /// blocks of flat colour on screen, and the eye reads any drift in them as
+    /// the renderer being wrong rather than as a photographic effect. The
+    /// tilt-shift pass was doing both things it must not do to them: the
+    /// gaussian blur made neighbouring canopies bleed through one another (the
+    /// "you can see trees through trees" ghosting) and the saturation lift
+    /// moved every canopy pixel OFF the game's palette (the paleness). Both
+    /// are measured against the 2D render by `tools/treediff.py` and by the
+    /// `trees.pixelmatch` harness check, which is why the mask exists rather
+    /// than a global "turn the post-process down".
+    tree_id: Vec<u16>,
+    tree_paint: Vec<u32>,
+    /// The tree unit currently being painted, or `NO_TREE`.
+    marking: u16,
+    /// GBA_3D_TRACE: only then is the painted colour worth recording.
+    tracing: bool,
+    /// Map coordinate of every tree unit drawn this frame, indexed by unit id.
+    tree_at: Vec<(i32, i32)>,
+}
+
+const NO_TREE: u16 = u16::MAX;
+
+/// How a textured pass treats pixels the depth buffer says are hidden.
+#[derive(Clone, Copy, PartialEq)]
+enum Ghost {
+    /// Normal opaque pass: draw what is in front, write depth.
+    Off,
+    /// Repaint the hidden part of the figure in full colour, over whatever
+    /// hides him. What a character walking behind a building gets.
+    Solid,
+    /// Repaint it as a faint silhouette. What a character behind a fence or a
+    /// tree gets.
+    Faint,
 }
 
 impl Renderer {
@@ -1262,6 +1299,11 @@ impl Renderer {
             counting: false,
             cov: 0,
             vis: 0,
+            tree_id: vec![NO_TREE; WIDTH * HEIGHT],
+            tree_paint: vec![0; WIDTH * HEIGHT],
+            marking: NO_TREE,
+            tracing: trace(),
+            tree_at: Vec::new(),
         }
     }
 
@@ -1300,6 +1342,7 @@ impl Renderer {
                         None => {
                             self.zbuf[i] = z;
                             self.buffer[i] = color;
+                            self.tree_id[i] = NO_TREE;
                         }
                     }
                 }
@@ -1315,18 +1358,17 @@ impl Renderer {
         uv: [(f32, f32); 3],
         sample: &mut impl FnMut(f32, f32) -> u32,
     ) {
-        self.tri_uv_mode(p, uv, sample, false)
+        self.tri_uv_mode(p, uv, sample, Ghost::Off)
     }
 
-    /// `ghost`: inverted depth test, no depth write, dimmed color -- used to
-    /// repaint the player's silhouette where scenery hides it (the
-    /// reference mod's occlusion silhouette).
+    /// `ghost` other than `Off`: inverted depth test, no depth write -- used
+    /// to repaint the player where scenery hides him.
     fn tri_uv_mode(
         &mut self,
         p: [(f32, f32, f32); 3],
         uv: [(f32, f32); 3],
         sample: &mut impl FnMut(f32, f32) -> u32,
-        ghost: bool,
+        ghost: Ghost,
     ) {
         let area = (p[1].0 - p[0].0) * (p[2].1 - p[0].1) - (p[1].1 - p[0].1) * (p[2].0 - p[0].0);
         if area.abs() < 1e-6 {
@@ -1372,27 +1414,46 @@ impl Renderer {
                             self.vis += 1;
                             self.zbuf[i] = z;
                             self.buffer[i] = c;
+                            self.tree_id[i] = NO_TREE;
                         }
                     }
                     continue;
                 }
-                if (z < self.zbuf[i]) != ghost {
+                if (z < self.zbuf[i]) == (ghost == Ghost::Off) {
                     let u = w0 * uv[0].0 + w1 * uv[1].0 + w2 * uv[2].0;
                     let v = w0 * uv[0].1 + w1 * uv[1].1 + w2 * uv[2].1;
                     let c = sample(u, v);
                     if c != SKIP {
-                        if ghost {
-                            // Translucent silhouette: mostly the figure, so a
-                            // building standing between him and the camera
-                            // reads as glass rather than as a box he is
-                            // trapped inside.
-                            let mix = |s: u32, a: u32| {
-                                (((a >> s & 0xFF) * 3 + (self.buffer[i] >> s & 0xFF)) / 4) << s
-                            };
-                            self.buffer[i] = mix(16, c) | mix(8, c) | mix(0, c);
-                        } else {
-                            self.zbuf[i] = z;
-                            self.buffer[i] = c;
+                        match ghost {
+                            // BEHIND A BUILDING HE IS SIMPLY IN FRONT OF IT.
+                            //
+                            // Hollowed-out glass reads as the character
+                            // dissolving, and against a roof that is exactly
+                            // what "he sinks into the house" looks like. Every
+                            // handheld Pokemon game that draws a diorama solves
+                            // this the blunt way: a character standing on a
+                            // walkable row behind a building is drawn WHOLE,
+                            // in full colour, over the roof. There is no
+                            // ambiguity to read past.
+                            Ghost::Solid => self.buffer[i] = c,
+                            // Anything else in front of him -- a fence, a
+                            // signpost, the corner of a tree -- is small, and a
+                            // faint silhouette through it is right: he must not
+                            // look like he is standing SOUTH of the fence.
+                            Ghost::Faint => {
+                                let mix = |s: u32, a: u32| {
+                                    (((a >> s & 0xFF) * 3 + (self.buffer[i] >> s & 0xFF)) / 4) << s
+                                };
+                                self.buffer[i] = mix(16, c) | mix(8, c) | mix(0, c);
+                            }
+                            Ghost::Off => {
+                                self.zbuf[i] = z;
+                                self.buffer[i] = c;
+                                self.tree_id[i] = self.marking;
+                                if self.tracing && self.marking != NO_TREE {
+                                    self.tree_paint[i] = c;
+                                }
+                            }
                         }
                     }
                 }
@@ -1407,9 +1468,14 @@ impl Renderer {
         self.tri_uv([q[0], q[2], q[3]], [(0.0, 0.0), (1.0, 1.0), (0.0, 1.0)], sample);
     }
 
-    fn quad_uv_ghost(&mut self, q: [(f32, f32, f32); 4], sample: &mut impl FnMut(f32, f32) -> u32) {
-        self.tri_uv_mode([q[0], q[1], q[2]], [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)], sample, true);
-        self.tri_uv_mode([q[0], q[2], q[3]], [(0.0, 0.0), (1.0, 1.0), (0.0, 1.0)], sample, true);
+    fn quad_uv_ghost(
+        &mut self,
+        q: [(f32, f32, f32); 4],
+        sample: &mut impl FnMut(f32, f32) -> u32,
+        mode: Ghost,
+    ) {
+        self.tri_uv_mode([q[0], q[1], q[2]], [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)], sample, mode);
+        self.tri_uv_mode([q[0], q[2], q[3]], [(0.0, 0.0), (1.0, 1.0), (0.0, 1.0)], sample, mode);
     }
 
     /// Blit a 240x160 frame at 3x nearest-neighbor, centered. `opaque_only`
@@ -1438,6 +1504,8 @@ impl Renderer {
     pub fn render(&mut self, cap: &Capture, flat: &[u32], grid: Option<&MapGrid>) {
         self.buffer.copy_from_slice(&self.background);
         self.zbuf.fill(f32::INFINITY);
+        self.tree_id.fill(NO_TREE);
+        self.tree_at.clear();
         if cap.bg_frame.len() < ppu::WIDTH * ppu::HEIGHT {
             return; // no capture yet (first frame)
         }
@@ -1471,6 +1539,33 @@ impl Renderer {
         // top of the finished 3D scene — UI must never extrude.
         if ui_pixels > 0 {
             self.blit_2d(&cap.ui_frame, true);
+        }
+        if trace() {
+            self.trace_trees();
+        }
+    }
+
+    /// One line per tree unit on screen: how many pixels its billboard won,
+    /// and how many of them the FINISHED frame no longer shows in the colour
+    /// the game's own artwork put there. The second number is the whole
+    /// question -- a tree that survives every later pass untouched is, pixel
+    /// for pixel, the 2D render's tree -- and `trees.pixelmatch` requires it
+    /// to be zero.
+    fn trace_trees(&self) {
+        let mut painted = vec![0u32; self.tree_at.len()];
+        let mut off = vec![0u32; self.tree_at.len()];
+        for (i, &id) in self.tree_id.iter().enumerate() {
+            if id == NO_TREE {
+                continue;
+            }
+            painted[id as usize] += 1;
+            off[id as usize] += (self.buffer[i] != self.tree_paint[i]) as u32;
+        }
+        for (id, &(gx, gy)) in self.tree_at.iter().enumerate() {
+            println!(
+                "TREE {gx} {gy} painted {} offpalette {}",
+                painted[id], off[id]
+            );
         }
     }
 
@@ -1534,6 +1629,8 @@ impl Renderer {
                         project(xe, 0.0, zbase),
                         project(x0, 0.0, zbase),
                     ];
+                    self.marking = self.tree_at.len() as u16;
+                    self.tree_at.push((g.gx0 + cx, g.gy0 + cy));
                     self.quad_uv(q, &mut |u, v| {
                         let px = (u * aw).clamp(0.0, aw - 0.5);
                         let py = (v * ah).clamp(0.0, ah - 0.5);
@@ -1552,6 +1649,7 @@ impl Renderer {
                             c
                         }
                     });
+                    self.marking = NO_TREE;
                     continue;
                 }
 
@@ -2005,9 +2103,27 @@ impl Renderer {
             // When the map says a built volume stands on the rows between him
             // and the camera, any occlusion at all is that volume, and the
             // silhouette comes up immediately.
+            // IS A BUILDING STANDING BETWEEN HIM AND THE CAMERA?
+            //
+            // The probe used to read the single column of cells under his
+            // anchor, and that column is a whole cell behind the picture for
+            // the sixteen frames of a step: FireRed moves the sprite across
+            // the gap first and the anchor follows the camera. So walking east
+            // along the row behind his house, the roof started swallowing him
+            // from the feet up while the map still said "nothing in front of
+            // you", and no silhouette came -- the sinking, exactly as
+            // reported, and it happened on the FIRST step onto every building.
+            //
+            // He is as wide as his cell, so the probe is as wide as he is:
+            // the cell under each of his shoulders as well as under his feet.
             let behind_volume = player
                 && (1..=3).any(|d| {
-                    matches!(mgrid.cell_at_map(ax, ay - 8 + d * 16), Cell::Block { h, .. } if h > 0.0)
+                    [-12, 0, 12].iter().any(|&sx| {
+                        matches!(
+                            mgrid.cell_at_map(ax + sx, ay - 8 + d * 16),
+                            Cell::Block { h, .. } if h > 0.0
+                        )
+                    })
                 });
             let center_dist =
                 (ccx - ppu::WIDTH as f32 / 2.0).abs() + (feet - ppu::HEIGHT as f32 / 2.0).abs();
@@ -2015,7 +2131,15 @@ impl Renderer {
             let ghost = center_dist < 40.0
                 && if behind_volume { hidden > 0 } else { hidden * 2 > self.cov };
             if ghost {
-                self.quad_uv_ghost(q, &mut sampler);
+                // Behind a building he is drawn whole and in full colour over
+                // the roof; behind anything smaller a faint silhouette is
+                // enough and keeps him from reading as standing in front of a
+                // fence he is really behind.
+                self.quad_uv_ghost(
+                    q,
+                    &mut sampler,
+                    if behind_volume { Ghost::Solid } else { Ghost::Faint },
+                );
             }
             if trace() {
                 println!(
@@ -2087,6 +2211,7 @@ impl Renderer {
             let s = (d / range).clamp(0.0, 1.0);
             s * s * spacing
         };
+        let keep = std::mem::take(&mut self.tree_id);
         let blur = |src: &[u32], dst: &mut [u32], horizontal: bool| {
             for y in 0..HEIGHT {
                 let o = strength(y);
@@ -2100,6 +2225,13 @@ impl Renderer {
                     continue;
                 }
                 for x in 0..WIDTH {
+                    // A tree's own pixels are the game's artwork and are
+                    // carried through untouched; blurring them is what let
+                    // neighbouring canopies show through one another.
+                    if keep[row + x] != NO_TREE {
+                        dst[row + x] = src[row + x];
+                        continue;
+                    }
                     let (mut r, mut g, mut b, mut wsum) = (0i32, 0i32, 0i32, 0i32);
                     for (k, &w) in WTS.iter().enumerate() {
                         for sgn in [-1i32, 1] {
@@ -2129,13 +2261,20 @@ impl Renderer {
         blur(&src, &mut tmp, true);
         self.buffer = src;
         blur(&tmp, &mut self.buffer, false);
-        // Saturation lift over the whole frame sells the model-photo feel.
-        for c in self.buffer.iter_mut() {
+        // Saturation lift sells the model-photo feel, but it moves a colour
+        // OFF the game's palette, so the trees are left out of it: they are
+        // the biggest flat areas on screen and the only ones the eye compares
+        // against its memory of the real game.
+        for (c, &id) in self.buffer.iter_mut().zip(keep.iter()) {
+            if id != NO_TREE {
+                continue;
+            }
             let (r, g, b) = ((*c >> 16 & 0xFF) as f32, (*c >> 8 & 0xFF) as f32, (*c & 0xFF) as f32);
             let luma = 0.299 * r + 0.587 * g + 0.114 * b;
             let mix = |ch: f32| (luma + (ch - luma) * sat).clamp(0.0, 255.0) as u32;
             *c = mix(r) << 16 | mix(g) << 8 | mix(b);
         }
+        self.tree_id = keep;
     }
 }
 
