@@ -47,8 +47,10 @@ const SKIP: u32 = 0xFFFF_FFFF;
 const STEP: f32 = 16.0;
 /// Water sits below ground so shorelines get a lip.
 const WATER: f32 = -3.0;
-/// How much taller than its map footprint a plant billboard stands.
-const PLANT_TALL: f32 = 1.5;
+/// How much taller than its map footprint a whole tree stands. Top-down art
+/// foreshortens a tree badly; standing the complete graphic up at 1:1 gives a
+/// squat shrub, and real dioramas stretch it a little.
+const TREE_TALL: f32 = 1.25;
 
 #[inline]
 fn rgb555(c: u16) -> u32 {
@@ -156,6 +158,12 @@ impl Art {
     #[inline]
     fn bot_at(&self, slot: usize, x: usize, y: usize) -> u32 {
         self.bot[slot * 256 + y * 16 + x]
+    }
+
+    /// Top layer alone; SKIP where the metatile draws nothing over its ground.
+    #[inline]
+    fn top_at(&self, slot: usize, x: usize, y: usize) -> u32 {
+        self.top[slot * 256 + y * 16 + x]
     }
 }
 
@@ -309,20 +317,19 @@ pub enum Cell {
     /// Nothing here: outside the real map, or one of FireRed's black padding
     /// metatiles. Never drawn, so the background shows through.
     Void,
-    /// Scenery that stands on the ground rather than being part of it: a tree,
-    /// a fence, a signpost, a bush. Rendered as the ground underneath (the
-    /// metatile's BOTTOM layer, so the object is not also painted flat on the
-    /// floor) plus one upright billboard of the object's own art.
-    ///
-    /// `rows` is how many cells the billboard spans north from this one, and
-    /// only the object's SOUTHERNMOST cell carries it: a tree two cells tall
-    /// is one canopy-over-trunk billboard, not two stacked blocks. `rows` = 0
-    /// means this cell is covered by a billboard belonging to a cell further
-    /// south and only draws its ground.
-    /// `plant` marks tree/bush art, whose picture lives in the metatile's
-    /// GROUND layer: painting that layer as floor under the billboard laid the
-    /// canopy out flat as a pale green shelf with a small tree standing on it.
-    Bill { rows: u8, plant: bool },
+    /// A one-cell prop that stands on the ground rather than being part of it:
+    /// a fence post, a signpost, a railing. Rendered as the ground underneath
+    /// (the metatile's BOTTOM layer, so the prop is not also painted flat on
+    /// the floor) plus one upright billboard of the prop's own art.
+    Bill,
+    /// A cell belonging to a TREE UNIT: the repeating multi-metatile graphic
+    /// FireRed tiles its tree borders out of. `w` x `h` is the unit's size in
+    /// cells and (`dx`, `dy`) is this cell's place inside it; only the unit's
+    /// north-west cell carries the billboard, which is the unit's WHOLE
+    /// composed picture as one quad. Every cell of the unit draws shadowed
+    /// grass as its floor — never its own art, which is what used to lay
+    /// canopies out flat as pale shelves.
+    Tree { w: u8, h: u8, dx: u8, dy: u8 },
     /// Part of a solid volume standing on this cell.
     ///
     /// `h` world height, `n` cells the volume spans north-to-south, `k` this
@@ -579,6 +586,96 @@ impl MapGrid {
             Kind::Struct
         };
 
+        // Pass 1: what kind of thing each window cell holds. Classifying every
+        // cell up front lets the tree pass below look at the window as a whole.
+        let mut kinds = Vec::with_capacity(Self::COLS * Self::ROWS);
+        for cy in 0..Self::ROWS as i32 {
+            for cx in 0..Self::COLS as i32 {
+                kinds.push(kind(gx0 + cx, gy0 + cy));
+            }
+        }
+        let kind_at = |cx: i32, cy: i32| -> Kind {
+            if cx < 0 || cy < 0 || cx >= Self::COLS as i32 || cy >= Self::ROWS as i32 {
+                Kind::Open
+            } else {
+                kinds[cy as usize * Self::COLS + cx as usize]
+            }
+        };
+
+        // TREE UNITS.
+        //
+        // FireRed's tree borders are one multi-metatile tree graphic tiled over
+        // and over, its neighbours overlapping. Earlier versions rebuilt trees
+        // cell by cell and stacked the pieces, which is why the border came out
+        // as ragged half-canopies with shelf lines across it: a 16-pixel slice
+        // of a tree is not a tree. So find the repeating unit ONCE for the
+        // whole window, straight from the metatile ids, and instance the whole
+        // graphic per occurrence.
+        let leaf_id = |cx: i32, cy: i32| -> Option<u16> {
+            (kind_at(cx, cy) == Kind::Plant).then(|| entry(gx0 + cx, gy0 + cy).unwrap_or(0) & 0x3FF)
+        };
+        // Shortest shift along an axis that maps the tree ids onto themselves.
+        let period = |sx: i32, sy: i32| -> i32 {
+            for q in 1..=4i32 {
+                let (mut ok, mut pairs) = (true, 0u32);
+                'scan: for cy in 0..Self::ROWS as i32 {
+                    for cx in 0..Self::COLS as i32 {
+                        if let (Some(a), Some(b)) =
+                            (leaf_id(cx, cy), leaf_id(cx + sx * q, cy + sy * q))
+                        {
+                            pairs += 1;
+                            if a != b {
+                                ok = false;
+                                break 'scan;
+                            }
+                        }
+                    }
+                }
+                if ok && pairs > 0 {
+                    return q;
+                }
+            }
+            1
+        };
+        let (pw, ph) = (period(1, 0), period(0, 1));
+        // Phase of the unit grid. It must be a property of the ARTWORK in MAP
+        // space, or the split would slide by a cell as the camera moves. FRLG
+        // stores a multi-metatile object's tiles in reading order, so the
+        // smallest id in the repeat is the unit's north-west corner.
+        let (mut phase, mut smallest) = ((0i32, 0i32), u16::MAX);
+        for cy in 0..Self::ROWS as i32 {
+            for cx in 0..Self::COLS as i32 {
+                if leaf_id(cx, cy).is_some_and(|id| id < smallest) {
+                    smallest = leaf_id(cx, cy).unwrap();
+                    phase = ((gx0 + cx).rem_euclid(pw), (gy0 + cy).rem_euclid(ph));
+                }
+            }
+        }
+        // The unit a plant cell belongs to: north-west cell plus size, clipped
+        // to cells that really are plants, so a lone bush or a half unit at a
+        // map edge is still a whole billboard of its own.
+        let unit = |cx: i32, cy: i32| -> (i32, i32, u8, u8) {
+            let dx = ((gx0 + cx).rem_euclid(pw) - phase.0).rem_euclid(pw);
+            let dy = ((gy0 + cy).rem_euclid(ph) - phase.1).rem_euclid(ph);
+            let (ax, ay) = (cx - dx, cy - dy);
+            if kind_at(ax, ay) != Kind::Plant {
+                return (cx, cy, 1, 1);
+            }
+            let mut w = 1;
+            while w < pw && kind_at(ax + w, ay) == Kind::Plant {
+                w += 1;
+            }
+            let mut h = 1;
+            while h < ph && kind_at(ax, ay + h) == Kind::Plant {
+                h += 1;
+            }
+            if dx >= w || dy >= h {
+                (cx, cy, 1, 1)
+            } else {
+                (ax, ay, w as u8, h as u8)
+            }
+        };
+
         let mut cells = Vec::with_capacity(Self::COLS * Self::ROWS);
         let mut slots = Vec::with_capacity(Self::COLS * Self::ROWS);
         let mut height = Vec::with_capacity(Self::COLS * Self::ROWS);
@@ -600,9 +697,12 @@ impl MapGrid {
                     height.push(0.0);
                     continue;
                 }
-                let cell = match kind(gx, gy) {
-                    Kind::Plant => Self::plant(gx, gy, &kind, &entry),
-                    Kind::Thin => Cell::Bill { rows: 1, plant: false },
+                let cell = match kind_at(cx, cy) {
+                    Kind::Plant => {
+                        let (ax, ay, w, h) = unit(cx, cy);
+                        Cell::Tree { w, h, dx: (cx - ax) as u8, dy: (cy - ay) as u8 }
+                    }
+                    Kind::Thin => Cell::Bill,
                     Kind::Struct => Self::structure(gx, gy, &kind, &entry),
                     Kind::Open if is_water(e) => Cell::Water,
                     Kind::Open => match behavior(e) {
@@ -676,71 +776,6 @@ impl MapGrid {
         })
     }
 
-    /// Which billboard a plant cell belongs to.
-    ///
-    /// Top-down tree art stacks a canopy over a trunk, and a tree BORDER
-    /// repeats that stack down the column. Each repeat is one tree: a border
-    /// of two-cell trees becomes a row of discrete trees rather than one
-    /// continuous hedge, and the tree's southernmost cell carries the whole
-    /// billboard while the cells above it only draw floor.
-    ///
-    /// Every judgement here is made from a fixed window of cells AROUND
-    /// (gx, gy), never from where a run of trees happens to start or end.
-    /// The previous version walked to the top of the run and split it into
-    /// repeats from there, but the walk was capped at twelve cells, so in a
-    /// tree border longer than that each cell measured its groups from a
-    /// different starting row and disagreed about which cell was the front
-    /// one. Nearly every cell then decided a neighbour carried the billboard,
-    /// and Pallet's tree line drew as bare floor with the odd tree left in it.
-    fn plant(
-        gx: i32,
-        gy: i32,
-        kind: &impl Fn(i32, i32) -> Kind,
-        entry: &impl Fn(i32, i32) -> Option<u16>,
-    ) -> Cell {
-        // Metatile id of a plant cell relative to this one, None if the cell
-        // holds something else.
-        let id = |dy: i32| -> Option<u16> {
-            (kind(gx, gy + dy) == Kind::Plant).then(|| entry(gx, gy + dy).unwrap_or(0) & 0x3FF)
-        };
-        const R: i32 = 4;
-        // Shortest vertical repeat of the artwork around this cell, 1-4.
-        let mut p = 1i32;
-        for q in 1..=R {
-            let matches = (-R..=R).all(|i| match (id(i), id(i + q)) {
-                (Some(a), Some(b)) => a == b,
-                _ => true,
-            });
-            if matches {
-                p = q;
-                break;
-            }
-        }
-        // Which cell of the repeat is the tree's FRONT. It has to be a
-        // property of the artwork, not of the window, or the split would slide
-        // by a cell as the camera moves. Taking the largest metatile id in the
-        // repeat is arbitrary but stable, and in FireRed's tilesets a tree's
-        // lower half is stored after its upper half, so it picks the trunk.
-        let mut south = 0i32;
-        let mut best = id(0);
-        for t in 1..p {
-            if id(t) > best {
-                best = id(t);
-                south = t;
-            }
-        }
-        if south != 0 {
-            return Cell::Bill { rows: 0, plant: true }; // a cell below carries it
-        }
-        // How many cells of the repeat above this one are really plants (the
-        // top of a border column may be cut short by the map edge).
-        let mut rows = 1u8;
-        while (rows as i32) < p && id(-(rows as i32)).is_some() {
-            rows += 1;
-        }
-        Cell::Bill { rows, plant: true }
-    }
-
     /// Decide what built volume the cell at (gx, gy) belongs to, purely from
     /// map data, so the answer is the same on every frame no matter where the
     /// cell sits on screen.
@@ -773,13 +808,72 @@ impl MapGrid {
         let j = (gy - top) as usize; // index from the run's north end
         let id = |i: usize| entry(gx, top + i as i32).unwrap_or(0) & 0x3FF;
         if len == 1 {
-            return Cell::Bill { rows: 1, plant: false };
+            return Cell::Bill;
         }
         if (0..len - 1).all(|i| id(i) == id(i + 1)) {
             return Cell::Block { h: STEP, n: 1, k: 0, wall: 0 };
         }
         let wall = (len - 1).min(2) as u8;
         Cell::Block { h: STEP * wall as f32, n: len as u8, k: j as u8, wall }
+    }
+
+    /// Where a character sprite really stands, from the map grid.
+    ///
+    /// A character's sprite hangs a few pixels BELOW the cell he occupies, so
+    /// the bottom pixel row alone reports the cell to the south. On the north
+    /// bank of a pond that cell is water, and he was drawn standing out over
+    /// the sunken surface. Sampling a few rows up and taking the highest
+    /// ground fixed the south bank and not the north one, because the height
+    /// was only half the problem: his billboard was still POSITIONED in the
+    /// water cell in front of him, which also made him lose the depth sort
+    /// against anything standing on that row.
+    ///
+    /// So find the cell he occupies instead. A walking character is never
+    /// inside a non-walkable cell, so scan the cells his lower body covers
+    /// from the feet upwards and take the first walkable one; only when every
+    /// candidate is water is he really on water (surfing).
+    ///
+    /// Returns that cell's ground height and its world z range, which the
+    /// caller clamps the billboard's base into.
+    pub fn foot_anchor(&self, px: usize, feet: f32) -> (f32, f32, f32) {
+        let cx = ((px + self.fine.0) / 16) as i32 + MX;
+        let bottom = (feet as i32 - 1).max(0);
+        let row_of = |py: i32| ((py as usize + self.fine.1) / 16) as i32 + MY_N;
+        // A character stands on WALKABLE ground. Water is not walkable (until
+        // Surf), and neither is the cell a tree, a fence or a pond rim
+        // occupies, so both only ever answer when nothing walkable is under
+        // him at all.
+        let (mut land, mut water, mut other) = (None, None, None);
+        for d in 0..16 {
+            let py = bottom - d;
+            if py < 0 {
+                break;
+            }
+            let cy = row_of(py);
+            match self.at(cx, cy) {
+                Cell::Void => {}
+                Cell::Flat | Cell::Grass => {
+                    land = Some(cy);
+                    break; // southernmost walkable cell his body covers
+                }
+                Cell::Water => water = water.or(Some(cy)),
+                _ => other = other.or(Some(cy)),
+            }
+        }
+        let (h, cy) = match (land, water, other) {
+            (Some(cy), ..) => (0.0, cy),
+            (None, Some(cy), _) => (WATER, cy),
+            (None, None, Some(cy)) => (0.0, cy),
+            _ => (0.0, row_of(bottom)),
+        };
+        // Inset the range a little from the cell's own edges. A character
+        // drawn exactly on his cell's southern edge has his feet touching the
+        // top of whatever the next row extrudes -- the lip of a pond reads as
+        // him standing ON the water's rim -- and standing him a few units into
+        // his own cell separates the two without breaking a walking step
+        // (the inset only holds him still for its own width mid-step).
+        const INSET: f32 = 4.0;
+        (h, self.oz - (cy + 1) as f32 * STEP + INSET, self.oz - cy as f32 * STEP - INSET)
     }
 
     /// Screen pixel -> window cell, for anchoring sprites and for the
@@ -805,6 +899,12 @@ pub struct Renderer {
     /// each transition instead of every frame.
     grid_ok: bool,
     no_walls: bool,
+    /// While true, a textured pass counts how much of itself it covered
+    /// (`cov`) and how much survived the depth test (`vis`). Sprites use it to
+    /// tell "swallowed by a building" from "his feet are behind a fence".
+    counting: bool,
+    cov: u32,
+    vis: u32,
 }
 
 impl Renderer {
@@ -833,6 +933,9 @@ impl Renderer {
                 .min(3),
             grid_ok: true,
             no_walls: std::env::var("GBA_NO_WALLS").is_ok(),
+            counting: false,
+            cov: 0,
+            vis: 0,
         }
     }
 
@@ -930,6 +1033,23 @@ impl Renderer {
                 }
                 let z = w0 * p[0].2 + w1 * p[1].2 + w2 * p[2].2;
                 let i = y * WIDTH + x;
+                if self.counting {
+                    // Coverage has to be measured before the depth test, so
+                    // this variant samples first. Only sprites use it; the
+                    // world pass keeps its early depth reject.
+                    let u = w0 * uv[0].0 + w1 * uv[1].0 + w2 * uv[2].0;
+                    let v = w0 * uv[0].1 + w1 * uv[1].1 + w2 * uv[2].1;
+                    let c = sample(u, v);
+                    if c != SKIP {
+                        self.cov += 1;
+                        if z < self.zbuf[i] {
+                            self.vis += 1;
+                            self.zbuf[i] = z;
+                            self.buffer[i] = c;
+                        }
+                    }
+                    continue;
+                }
                 if (z < self.zbuf[i]) != ghost {
                     let u = w0 * uv[0].0 + w1 * uv[1].0 + w2 * uv[2].0;
                     let v = w0 * uv[0].1 + w1 * uv[1].1 + w2 * uv[2].1;
@@ -1046,64 +1166,90 @@ impl Renderer {
                 let h = g.height[i];
                 let slot = g.slots[i] as usize;
 
-                // Scenery stands up. The ground under it is drawn from the
-                // metatile's BOTTOM layer only, so a fence is not also painted
-                // flat on the floor underneath itself (which read as the fence
-                // hovering over its own shadow).
-                if let Cell::Bill { rows, plant } = cell {
-                    let ground =
-                        [project(x0, 0.0, zn), project(x1, 0.0, zn), project(x1, 0.0, zs), project(x0, 0.0, zs)];
-                    // A fence or a sign is an overlay drawn over real ground,
-                    // so its bottom layer IS the floor. A tree is not: FireRed
-                    // draws the canopy itself in the ground layer, so painting
-                    // that layer flat gave every tree a pale green shelf under
-                    // it and turned the Pallet tree border into terraces. Take
-                    // the floor from the nearest open cell instead and darken
-                    // it: what is under a canopy is shaded grass.
-                    if plant {
-                        let (gs, dark) = g.floor_near(cx, cy);
-                        self.quad_uv(ground, &mut |u, v| {
-                            shade(
-                                g.art.comp_at(
-                                    gs,
-                                    (u * 16.0).clamp(0.0, 15.0) as usize,
-                                    (v * 16.0).clamp(0.0, 15.0) as usize,
-                                ),
-                                dark,
-                            )
-                        });
-                    } else {
-                        self.quad_uv(ground, &mut |u, v| {
-                            g.art.bot_at(
-                                slot,
+                let ground = [
+                    project(x0, 0.0, zn),
+                    project(x1, 0.0, zn),
+                    project(x1, 0.0, zs),
+                    project(x0, 0.0, zs),
+                ];
+
+                // A TREE is drawn as ONE quad carrying the repeating unit's
+                // whole composed graphic, exactly the way a diorama would hold
+                // up the original sprite. Nothing is reconstructed per cell,
+                // so there are no 16-pixel slices to leave shelf lines and no
+                // half canopies at the window edge.
+                if let Cell::Tree { w, h, dx, dy } = cell {
+                    // The floor under every cell of the unit is the grass next
+                    // door in shadow. Painting the tree's own metatile flat is
+                    // what put a pale green shelf under each canopy.
+                    let (gs, dark) = g.floor_near(cx, cy);
+                    self.quad_uv(ground, &mut |u, v| {
+                        shade(
+                            g.art.comp_at(
+                                gs,
                                 (u * 16.0).clamp(0.0, 15.0) as usize,
                                 (v * 16.0).clamp(0.0, 15.0) as usize,
-                            )
-                        });
+                            ),
+                            dark,
+                        )
+                    });
+                    if dx != 0 || dy != 0 {
+                        continue; // the unit's north-west cell carries the tree
                     }
-                    if rows == 0 {
-                        continue; // a billboard further south covers this cell
-                    }
-                    let r = rows as i32;
+                    let (w, h) = (w as i32, h as i32);
+                    let xe = g.ox + (cx + w) as f32 * STEP;
+                    let zbase = g.oz - (cy + h) as f32 * STEP; // unit's south edge
+                    let (aw, ah) = ((w * 16) as f32, (h * 16) as f32);
+                    let hgt = ah * TREE_TALL;
+                    let (uy, uz) = (COS_P, SIN_P);
+                    let q = [
+                        project(x0, hgt * uy, zbase + hgt * uz),
+                        project(xe, hgt * uy, zbase + hgt * uz),
+                        project(xe, 0.0, zbase),
+                        project(x0, 0.0, zbase),
+                    ];
+                    self.quad_uv(q, &mut |u, v| {
+                        let px = (u * aw).clamp(0.0, aw - 0.5);
+                        let py = (v * ah).clamp(0.0, ah - 0.5);
+                        let src = g.slot_at(cx + px as i32 / 16, cy + py as i32 / 16, slot);
+                        let (ax, ay) = (px as usize % 16, py as usize % 16);
+                        let c = g.art.comp_at(src, ax, ay);
+                        // The unit's transparent edges: where the metatile
+                        // draws nothing of its own over its ground layer and
+                        // that ground pixel is exactly the grass beside the
+                        // tree, the pixel is background, not canopy. Cutting
+                        // it out is what lets a free-standing tree read as a
+                        // tree rather than a rectangle of turf stood on end.
+                        if g.art.top_at(src, ax, ay) == SKIP && c == g.art.comp_at(gs, ax, ay) {
+                            SKIP
+                        } else {
+                            c
+                        }
+                    });
+                    continue;
+                }
+
+                // A one-cell prop (fence post, sign) stands up over its own
+                // ground: its bottom layer IS the floor it is drawn over, so
+                // the prop is not also painted flat under itself.
+                if cell == Cell::Bill {
+                    self.quad_uv(ground, &mut |u, v| {
+                        g.art.bot_at(
+                            slot,
+                            (u * 16.0).clamp(0.0, 15.0) as usize,
+                            (v * 16.0).clamp(0.0, 15.0) as usize,
+                        )
+                    });
                     // Stand the art on the ground by its lowest DRAWN row, not
                     // by the tile edge: fence art sits in the upper part of its
                     // tile, and hanging that from the tile edge left the fence
                     // floating above the grass.
-                    // Only an overlay (fence, sign) is stood on its lowest
-                    // drawn row; a tree's picture fills its tile.
-                    let pad = if !plant && g.art.cover[slot] > 0.05 {
+                    let pad = if g.art.cover[slot] > 0.05 {
                         (15 - g.art.ymax[slot].max(0)) as f32
                     } else {
                         0.0
                     };
-                    let art_h = (r * 16) as f32 - pad;
-                    // A tree drawn from above is not as tall as it is wide;
-                    // standing its art up at 1:1 left a stubby 16-pixel bush
-                    // per cell with bare floor showing between the row. Real
-                    // trees are taller than their footprint, and stretching
-                    // them is also what makes a border row of them overlap
-                    // into one dense canopy instead of a dotted line.
-                    let hgt = if plant { art_h * PLANT_TALL } else { art_h };
+                    let hgt = 16.0 - pad;
                     let (uy, uz) = (COS_P, SIN_P);
                     let q = [
                         project(x0, hgt * uy, zs + hgt * uz),
@@ -1111,25 +1257,12 @@ impl Renderer {
                         project(x1, 0.0, zs),
                         project(x0, 0.0, zs),
                     ];
-                    let n0 = cy - r + 1;
                     self.quad_uv(q, &mut |u, v| {
-                        let gv = v.clamp(0.0, 0.999) * art_h;
-                        let sc = (gv as i32 / 16).min(r - 1);
-                        let src = g.slot_at(cx, n0 + sc, slot);
-                        let (ax, ay) = (
+                        g.art.object_at(
+                            slot,
                             (u * 16.0).clamp(0.0, 15.0) as usize,
-                            (gv - (sc * 16) as f32).clamp(0.0, 15.0) as usize,
-                        );
-                        // A tree stands up as its WHOLE picture. Its canopy is
-                        // painted in the metatile's ground layer with only a
-                        // few overhanging pixels on the top layer, so taking
-                        // the top layer alone (right for a fence standing on
-                        // grass) left a bare sliver of leaves in the air.
-                        if plant {
-                            g.art.comp_at(src, ax, ay)
-                        } else {
-                            g.art.object_at(src, ax, ay)
-                        }
+                            (v.clamp(0.0, 0.999) * hgt) as usize,
+                        )
                     });
                     continue;
                 }
@@ -1313,48 +1446,49 @@ impl Renderer {
             // was drawn standing on the sunken water surface. Take the highest
             // ground under the sprite's lower body instead.
             let fx = ((min_x + max_x) as usize / 2).min(W - 1);
-            let ground = [2usize, 8, 14]
-                .iter()
-                .map(|d| {
-                    let fy = (feet as usize).saturating_sub(*d).min(ppu::HEIGHT - 1);
-                    match mgrid.cell_of_screen(fx, fy) {
-                        Cell::Water => WATER,
-                        _ => 0.0,
-                    }
-                })
-                .fold(f32::NEG_INFINITY, f32::max);
+            let (ground, z_south, z_north) = mgrid.foot_anchor(fx, feet);
+
+            // Stand him IN the cell the map says he occupies. Clamping rather
+            // than snapping keeps a step between two cells continuous: the
+            // clamp only ever moves him the few pixels his sprite overhangs.
+            let (wx0, _, wz_raw) = world(min_x, feet, 0.0);
+            let wz0 = wz_raw.clamp(z_south, z_north);
 
             // Contact shadow first (drawn onto the ground, no z write).
             let (ccx, cw) = ((min_x + max_x) / 2.0, (max_x - min_x) / 2.0);
+            let cxw = ccx - ppu::WIDTH as f32 / 2.0;
             let n = 10;
             for k in 0..n {
                 let (a0, a1) = (
                     std::f32::consts::TAU * k as f32 / n as f32,
                     std::f32::consts::TAU * (k + 1) as f32 / n as f32,
                 );
+                // The shadow hugs the cell he stands in: an ellipse as deep as
+                // half his width used to spill onto the row in front of him,
+                // which on a bank is the water.
+                let zc = wz0 + cw * 0.35;
                 let pt = |a: f32| {
-                    let (wx, wy, wz) = world(
-                        ccx + cw * 0.85 * a.cos(),
-                        feet - 1.0 + cw * 0.5 * a.sin(),
-                        ground + 0.15,
-                    );
-                    project(wx, wy, wz)
+                    project(cxw + cw * 0.85 * a.cos(), ground + 0.15, zc + cw * 0.35 * a.sin())
                 };
-                let (cxw, cyw, czw) = world(ccx, feet - 1.0, ground + 0.15);
-                self.tri([project(cxw, cyw, czw), pt(a0), pt(a1)], 0, Some(0.55));
+                self.tri([project(cxw, ground + 0.15, zc), pt(a0), pt(a1)], 0, Some(0.55));
             }
 
             let top = pixels.iter().map(|i| i / W).min().unwrap() as f32;
             let hart = feet - top;
             // Lean-back unit vector: up tilted north by the pitch angle.
             let (uy, uz) = (COS_P, SIN_P);
-            let (wx0, _, wz0) = world(min_x, feet, 0.0);
             let wx1 = wx0 + (max_x - min_x);
-            // A sprite is drawn ON the ground it stands on, and beside the
-            // wall it stands against; both are at the same depth, so without a
-            // bias toward the camera the figure loses the depth test in places
-            // and the scenery eats bites out of him.
-            const BIAS: f32 = 6.0;
+            // A sprite is drawn ON the ground it stands on, so its base and
+            // that ground are at exactly the same depth and fight over the
+            // pixels at his feet; a hair of bias toward the camera settles it.
+            //
+            // The bias used to be six units, and a leaning billboard's whole
+            // quad sits at ONE depth, so six units ate most of the thirteen a
+            // full map row is worth. Anything standing on the row in front of
+            // him -- a fence, a sign -- then lost the sort and he drew over it,
+            // reading as though he were south of the fence. Two units cannot
+            // beat a row.
+            const BIAS: f32 = 2.0;
             let lean = |x: f32, h: f32| {
                 let (a, b, c) = project(x, ground + h * uy, wz0 + h * uz);
                 (a, b, c - BIAS)
@@ -1375,13 +1509,21 @@ impl Renderer {
                 // would paint bits of the other at its own depth.
                 if owner[i] != fig as u16 { SKIP } else { grid[i] & 0x00FF_FFFF }
             };
+            self.counting = true;
+            self.cov = 0;
+            self.vis = 0;
             self.quad_uv(q, &mut sampler);
+            self.counting = false;
             // Repaint the figure closest to screen center (the player) as a
             // translucent silhouette wherever scenery hides it, so walking
-            // behind a house or tree never loses the character.
+            // behind a house or tree never loses the character. Only when
+            // scenery really swallows him, though: painting him through a
+            // fence that crosses his shins put him visibly in front of it,
+            // which is exactly the "he looks like he is south of the fence"
+            // report.
             let center_dist =
                 (ccx - ppu::WIDTH as f32 / 2.0).abs() + (feet - ppu::HEIGHT as f32 / 2.0).abs();
-            if center_dist < 40.0 {
+            if center_dist < 40.0 && (self.cov - self.vis) * 2 > self.cov {
                 self.quad_uv_ghost(q, &mut sampler);
             }
         }
