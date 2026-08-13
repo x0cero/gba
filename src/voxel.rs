@@ -345,6 +345,13 @@ pub enum Cell {
 pub struct MapGrid {
     /// Fine scroll of the ground layer, 0..15 pixels (sub-cell camera motion).
     pub fine: (usize, usize),
+    /// Map cell coordinates of window cell (0, 0), and the player's map cell.
+    /// Only used by the trace/regression harness, which needs every number it
+    /// checks to be expressed in MAP space so two camera positions can be
+    /// compared cell for cell.
+    pub gx0: i32,
+    pub gy0: i32,
+    pub player: (i32, i32),
     pub cells: Vec<Cell>,
     /// Art slot per cell.
     slots: Vec<u32>,
@@ -384,6 +391,25 @@ struct Cam {
 
 thread_local! {
     static CAM: std::cell::Cell<Option<Cam>> = const { std::cell::Cell::new(None) };
+}
+
+/// Southern rows of a built volume that stand up as its front (GBA_3D_WALL,
+/// default 2). See `structure()` for why this is the knob that controls how
+/// much ground a building hides.
+fn wall_steps() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("GBA_3D_WALL").ok().and_then(|v| v.parse().ok()).unwrap_or(2).clamp(1, 3)
+    })
+}
+
+/// GBA_3D_TRACE=1: emit one machine-readable line per frame for every quantity
+/// the regression harness checks (camera, per-figure anchors, geometry hash),
+/// so smoothness, anchor stability and geometry stability are all decided by
+/// numbers instead of by looking at pictures.
+pub fn trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GBA_3D_TRACE").is_ok())
 }
 
 /// Cells of margin kept outside the visible frame on each side. North needs
@@ -614,66 +640,82 @@ impl MapGrid {
         let leaf_id = |cx: i32, cy: i32| -> Option<u16> {
             (kind_at(cx, cy) == Kind::Plant).then(|| entry(gx0 + cx, gy0 + cy).unwrap_or(0) & 0x3FF)
         };
-        // Shortest shift along an axis that maps the tree ids onto themselves.
-        let period = |sx: i32, sy: i32| -> i32 {
-            for q in 1..=4i32 {
-                let (mut ok, mut pairs) = (true, 0u32);
-                'scan: for cy in 0..Self::ROWS as i32 {
-                    for cx in 0..Self::COLS as i32 {
-                        if let (Some(a), Some(b)) =
-                            (leaf_id(cx, cy), leaf_id(cx + sx * q, cy + sy * q))
-                        {
-                            pairs += 1;
-                            if a != b {
-                                ok = false;
-                                break 'scan;
-                            }
-                        }
-                    }
-                }
-                if ok && pairs > 0 {
-                    return q;
-                }
-            }
-            1
-        };
-        let (pw, ph) = (period(1, 0), period(0, 1));
-        // Phase of the unit grid. It must be a property of the ARTWORK in MAP
-        // space, or the split would slide by a cell as the camera moves. FRLG
-        // stores a multi-metatile object's tiles in reading order, so the
-        // smallest id in the repeat is the unit's north-west corner.
-        let (mut phase, mut smallest) = ((0i32, 0i32), u16::MAX);
+        // FRLG stores a multi-metatile object's tiles CONSECUTIVELY in reading
+        // order, so a tree unit's ids run i, i+1 across a row and jump by the
+        // unit's width to the next row. That makes the unit readable straight
+        // off the ids of a cell and its neighbours, with no phase, no modular
+        // arithmetic against the window origin and no per-window search --
+        // which is what used to make the same tree border resolve differently
+        // from different camera positions, and drop most of it back to
+        // one-cell blobs.
+        //
+        // Width first: the longest run of east neighbours whose id is exactly
+        // one more, over the whole window, is the unit width (capped at 4).
+        let mut pw = 1i32;
         for cy in 0..Self::ROWS as i32 {
+            let mut run = 1i32;
             for cx in 0..Self::COLS as i32 {
-                if leaf_id(cx, cy).is_some_and(|id| id < smallest) {
-                    smallest = leaf_id(cx, cy).unwrap();
-                    phase = ((gx0 + cx).rem_euclid(pw), (gy0 + cy).rem_euclid(ph));
+                match (leaf_id(cx, cy), leaf_id(cx + 1, cy)) {
+                    (Some(a), Some(b)) if b == a + 1 => {
+                        run += 1;
+                        pw = pw.max(run.min(4));
+                    }
+                    _ => run = 1,
                 }
             }
         }
-        // The unit a plant cell belongs to: north-west cell plus size, clipped
-        // to cells that really are plants, so a lone bush or a half unit at a
-        // map edge is still a whole billboard of its own.
+        // The unit a plant cell belongs to: walk west while the id keeps
+        // decrementing and north while it drops by a full unit width, then
+        // measure the unit's extent the same way. Every step is a local test
+        // on map data, so the answer for a given map cell is the same from
+        // every camera position.
+        // The walk runs in MAP coordinates, not window coordinates: a unit
+        // straddling the window's own edge must still resolve to the same
+        // unit, or the identical border would be built differently from two
+        // camera positions (which the regression harness checks).
+        let plant_id = |gx: i32, gy: i32| -> Option<u16> {
+            // Inside the window the classification is already computed; only a
+            // unit straddling the window edge pays for a fresh one.
+            let (cx, cy) = (gx - gx0, gy - gy0);
+            let k = if (0..Self::COLS as i32).contains(&cx) && (0..Self::ROWS as i32).contains(&cy) {
+                kinds[cy as usize * Self::COLS + cx as usize]
+            } else {
+                kind(gx, gy)
+            };
+            (k == Kind::Plant).then(|| entry(gx, gy).unwrap_or(0) & 0x3FF)
+        };
         let unit = |cx: i32, cy: i32| -> (i32, i32, u8, u8) {
-            let dx = ((gx0 + cx).rem_euclid(pw) - phase.0).rem_euclid(pw);
-            let dy = ((gy0 + cy).rem_euclid(ph) - phase.1).rem_euclid(ph);
-            let (ax, ay) = (cx - dx, cy - dy);
-            if kind_at(ax, ay) != Kind::Plant {
-                return (cx, cy, 1, 1);
+            let (gx, gy) = (gx0 + cx, gy0 + cy);
+            let (mut ax, mut ay) = (gx, gy);
+            while gx - ax < 3
+                && plant_id(ax - 1, ay).zip(plant_id(ax, ay)).is_some_and(|(w, c)| w + 1 == c)
+            {
+                ax -= 1;
+            }
+            while gy - ay < 3
+                && plant_id(ax, ay - 1)
+                    .zip(plant_id(ax, ay))
+                    .is_some_and(|(n, c)| n + pw as u16 == c)
+            {
+                ay -= 1;
             }
             let mut w = 1;
-            while w < pw && kind_at(ax + w, ay) == Kind::Plant {
+            while w < 4
+                && plant_id(ax + w, ay)
+                    .zip(plant_id(ax + w - 1, ay))
+                    .is_some_and(|(e, c)| e == c + 1)
+            {
                 w += 1;
             }
             let mut h = 1;
-            while h < ph && kind_at(ax, ay + h) == Kind::Plant {
+            while h < 4
+                && plant_id(ax, ay + h)
+                    .zip(plant_id(ax, ay + h - 1))
+                    .is_some_and(|(s, c)| s == c + w as u16)
+            {
                 h += 1;
             }
-            if dx >= w || dy >= h {
-                (cx, cy, 1, 1)
-            } else {
-                (ax, ay, w as u8, h as u8)
-            }
+            (ax - gx0, ay - gy0, w as u8, h as u8)
         };
 
         let mut cells = Vec::with_capacity(Self::COLS * Self::ROWS);
@@ -765,8 +807,14 @@ impl MapGrid {
                 }
             }
         }
+        if trace() {
+            eprintln!("TRACE cam {camx} {camy} fine {} {} gx0 {gx0} gy0 {gy0} player {px} {py}", fine.0, fine.1);
+        }
         Some(MapGrid {
             fine,
+            gx0,
+            gy0,
+            player: (px, py),
             cells,
             slots,
             height,
@@ -810,70 +858,89 @@ impl MapGrid {
         if len == 1 {
             return Cell::Bill;
         }
+        // A BUILT VOLUME HAS TO BE THICK. A house is a blob at least two cells
+        // across; a pond rim, a hedge line or a ledge is a line of blocked
+        // cells one cell thick, and running the same extrusion over it turned
+        // Pallet's pond into tall smooth green slabs with the rim art draped
+        // flat along their tops. So a run with nothing built beside it stands
+        // exactly one step high and wears its own art, which reads as the lip
+        // it is.
+        let thick = kind(gx - 1, gy) == Kind::Struct || kind(gx + 1, gy) == Kind::Struct;
+        if !thick {
+            return Cell::Block { h: STEP, n: 1, k: 0, wall: 0 };
+        }
         if (0..len - 1).all(|i| id(i) == id(i + 1)) {
             return Cell::Block { h: STEP, n: 1, k: 0, wall: 0 };
         }
-        let wall = (len - 1).min(2) as u8;
+        // How many of a volume's southern rows stand up as its front, and so
+        // how tall the volume is. This is the single number that decides how
+        // far a building's picture climbs UP the screen, because a lift of h
+        // world units moves a thing's image about h * COS_P * FOCAL / CAM_DIST
+        // screen pixels north: at two steps a house hides the two ground rows
+        // in front of it, which is what makes a one-cell walkable gap beside a
+        // building read as a sliver. GBA_3D_WALL=1 halves that.
+        let wall = (len - 1).min(wall_steps()) as u8;
         Cell::Block { h: STEP * wall as f32, n: len as u8, k: j as u8, wall }
     }
 
-    /// Where a character sprite really stands, from the map grid.
-    ///
-    /// A character's sprite hangs a few pixels BELOW the cell he occupies, so
-    /// the bottom pixel row alone reports the cell to the south. On the north
-    /// bank of a pond that cell is water, and he was drawn standing out over
-    /// the sunken surface. Sampling a few rows up and taking the highest
-    /// ground fixed the south bank and not the north one, because the height
-    /// was only half the problem: his billboard was still POSITIONED in the
-    /// water cell in front of him, which also made him lose the depth sort
-    /// against anything standing on that row.
-    ///
-    /// So find the cell he occupies instead. A walking character is never
-    /// inside a non-walkable cell, so scan the cells his lower body covers
-    /// from the feet upwards and take the first walkable one; only when every
-    /// candidate is water is he really on water (surfing).
-    ///
-    /// Returns that cell's ground height and its world z range, which the
-    /// caller clamps the billboard's base into.
-    pub fn foot_anchor(&self, px: usize, feet: f32) -> (f32, f32, f32) {
-        let cx = ((px + self.fine.0) / 16) as i32 + MX;
-        let bottom = (feet as i32 - 1).max(0);
-        let row_of = |py: i32| ((py as usize + self.fine.1) / 16) as i32 + MY_N;
-        // A character stands on WALKABLE ground. Water is not walkable (until
-        // Surf), and neither is the cell a tree, a fence or a pond rim
-        // occupies, so both only ever answer when nothing walkable is under
-        // him at all.
-        let (mut land, mut water, mut other) = (None, None, None);
-        for d in 0..16 {
-            let py = bottom - d;
-            if py < 0 {
-                break;
-            }
-            let cy = row_of(py);
-            match self.at(cx, cy) {
-                Cell::Void => {}
-                Cell::Flat | Cell::Grass => {
-                    land = Some(cy);
-                    break; // southernmost walkable cell his body covers
-                }
-                Cell::Water => water = water.or(Some(cy)),
-                _ => other = other.or(Some(cy)),
+    /// The camera's position in map pixels. FireRed locks the camera to the
+    /// player: measured over a walking step, `camy` is exactly the player
+    /// cell's centre line, and it advances one pixel per frame with no jitter
+    /// at all. It is the only continuous, animation-proof statement of where
+    /// the player is, which is why the sprite anchor is built on it.
+    #[inline]
+    pub fn camera(&self) -> (i32, i32) {
+        ((self.gx0 + 7 + MX) * 16 + self.fine.0 as i32, (self.gy0 + 5 + MY_N) * 16 + self.fine.1 as i32)
+    }
+
+    /// World x / world z of a map-pixel coordinate. Identical to what `world()`
+    /// gives for the equivalent screen pixel, but expressed in map space so a
+    /// sprite anchor can be stated in the same coordinates as the terrain.
+    #[inline]
+    pub fn world_of_map(&self, mx: i32, my: i32) -> (f32, f32) {
+        let (camx, camy) = self.camera();
+        ((mx - camx - 8) as f32, (80 - (my - camy + 80)) as f32)
+    }
+
+    /// Ground height at a map-pixel position: the cell's own elevation, except
+    /// that a character is never standing on water or on top of a solid, so
+    /// those read as ordinary ground.
+    pub fn ground_at_map(&self, mx: i32, my: i32) -> f32 {
+        let cx = mx.div_euclid(16) - self.gx0;
+        let cy = my.div_euclid(16) - self.gy0;
+        match self.at(cx, cy) {
+            Cell::Water => WATER,
+            _ => 0.0,
+        }
+    }
+
+    /// Map-pixel coordinate a GBA screen pixel looks at. Screen pixel (112, 80)
+    /// is the camera, and the camera is `(gx0 + 7 + MX) * 16 + fine.0` in map
+    /// pixels by construction of the window.
+    pub fn map_pixel(&self, px: usize, py: usize) -> (i32, i32) {
+        let camx = (self.gx0 + 7 + MX) * 16 + self.fine.0 as i32;
+        let camy = (self.gy0 + 5 + MY_N) * 16 + self.fine.1 as i32;
+        (camx + px as i32 - 112, camy + py as i32 - 80)
+    }
+
+    /// One line per window cell, keyed by MAP coordinate, for the harness's
+    /// geometry-stability check: the same map area seen from two camera
+    /// positions must produce character-for-character identical lines.
+    pub fn trace_geometry(&self) {
+        for cy in 0..Self::ROWS as i32 {
+            for cx in 0..Self::COLS as i32 {
+                let c = match self.at(cx, cy) {
+                    Cell::Flat => "F".to_string(),
+                    Cell::Grass => "G".to_string(),
+                    Cell::Water => "W".to_string(),
+                    Cell::Void => "V".to_string(),
+                    Cell::Bill => "B".to_string(),
+                    Cell::Tree { w, h, dx, dy } => format!("T{w}{h}{dx}{dy}"),
+                    Cell::Block { h, n, k, wall } => format!("K{h}:{n}:{k}:{wall}"),
+                };
+                println!("GEOM {} {} {c}", self.gx0 + cx, self.gy0 + cy);
             }
         }
-        let (h, cy) = match (land, water, other) {
-            (Some(cy), ..) => (0.0, cy),
-            (None, Some(cy), _) => (WATER, cy),
-            (None, None, Some(cy)) => (0.0, cy),
-            _ => (0.0, row_of(bottom)),
-        };
-        // Inset the range a little from the cell's own edges. A character
-        // drawn exactly on his cell's southern edge has his feet touching the
-        // top of whatever the next row extrudes -- the lip of a pond reads as
-        // him standing ON the water's rim -- and standing him a few units into
-        // his own cell separates the two without breaking a walking step
-        // (the inset only holds him still for its own width mid-step).
-        const INSET: f32 = 4.0;
-        (h, self.oz - (cy + 1) as f32 * STEP + INSET, self.oz - cy as f32 * STEP - INSET)
     }
 
     /// Screen pixel -> window cell, for anchoring sprites and for the
@@ -1434,28 +1501,67 @@ impl Renderer {
             let feet = pixels.iter().map(|i| i / W).max().unwrap() as f32 + 1.0;
             let min_x = pixels.iter().map(|i| i % W).min().unwrap() as f32;
             let max_x = pixels.iter().map(|i| i % W).max().unwrap() as f32 + 1.0;
-            // Anchor at the feet cell's GROUND elevation, never on top of a
-            // blocked volume: a sprite overlapping a building on screen stands
-            // on the ground behind it in world space, and the depth buffer
-            // occludes it naturally (the silhouette pass shows the player
-            // through).
+            let (ccx, cw) = ((min_x + max_x) / 2.0, (max_x - min_x) / 2.0);
+            // WHERE THE FIGURE STANDS.
             //
-            // A character sprite hangs a few pixels below the map cell he
-            // occupies, so the bottom pixel row alone reported the cell SOUTH
-            // of him. On the bank of a pond that cell is water, and the player
-            // was drawn standing on the sunken water surface. Take the highest
-            // ground under the sprite's lower body instead.
+            // Not from his pixels. A character's drawn feet move a pixel or
+            // two every animation frame, FireRed's bump animation walks the
+            // sprite bodily into the obstacle and back while the character
+            // never leaves his cell, and the sprite arrives at a step's
+            // destination eight frames before the camera finishes scrolling
+            // there. Reading a map cell off those pixels made the anchor jump
+            // rows during a bump (the "walks through the fence then snaps
+            // back"), and clamping the billboard into the cell it named made
+            // the sprite crawl against the smoothly moving camera (the
+            // jitter).
+            //
+            // The camera IS the player, exactly and continuously, so the
+            // player's foot line is the camera's own map row. The pixels are
+            // used only to say WHICH cell offset from the camera a figure is,
+            // rounded to whole cells, which is immune to a few pixels of
+            // animation; for the player that offset is zero on every frame of
+            // a walk, a bump and a turn alike.
             let fx = ((min_x + max_x) as usize / 2).min(W - 1);
-            let (ground, z_south, z_north) = mgrid.foot_anchor(fx, feet);
-
-            // Stand him IN the cell the map says he occupies. Clamping rather
-            // than snapping keeps a step between two cells continuous: the
-            // clamp only ever moves him the few pixels his sprite overhangs.
-            let (wx0, _, wz_raw) = world(min_x, feet, 0.0);
-            let wz0 = wz_raw.clamp(z_south, z_north);
+            let (camx, camy) = mgrid.camera();
+            let measured = mgrid.map_pixel(fx, feet as usize);
+            let player = (ccx - 120.0).abs() < 24.0 && (feet - 88.0).abs() < 24.0;
+            let (ax, ay) = if player {
+                // Whole cells only, and with a deadband: a character's drawn
+                // box sits about half a cell off the camera line by
+                // construction, so plain rounding lands exactly on the tie and
+                // flickers between two cells frame to frame. Anything under
+                // three quarters of a cell is the camera's own figure.
+                let snap = |d: i32| {
+                    if d.abs() < 12 { 0 } else { (d as f32 / 16.0).round() as i32 * 16 }
+                };
+                (
+                    camx + snap(measured.0 - camx),
+                    camy + 8 + snap(measured.1 - camy - 8),
+                )
+            } else {
+                // Other characters move continuously in map space, so their
+                // measurement is used as is: a character's drawn foot line
+                // falls on his own cell's southern edge, which is exactly
+                // where a billboard should stand.
+                measured
+            };
+            let ground = mgrid.ground_at_map(ax, ay - 8);
+            let (_, wz0) = mgrid.world_of_map(ax, ay);
+            let wx0 = world(min_x, feet, 0.0).0;
+            if trace() {
+                println!(
+                    "FIG {fig} box {min_x} {max_x} {feet} mappix {mpx} {mpy} anchor {ax} {ay} cell {ccx2} {ccy2} ground {ground} wz {wz0} gamecell {gcx} {gcy} player {isp}",
+                    mpx = measured.0,
+                    mpy = measured.1,
+                    ccx2 = ax.div_euclid(16),
+                    ccy2 = (ay - 8).div_euclid(16),
+                    gcx = mgrid.player.0,
+                    gcy = mgrid.player.1,
+                    isp = player as u8,
+                );
+            }
 
             // Contact shadow first (drawn onto the ground, no z write).
-            let (ccx, cw) = ((min_x + max_x) / 2.0, (max_x - min_x) / 2.0);
             let cxw = ccx - ppu::WIDTH as f32 / 2.0;
             let n = 10;
             for k in 0..n {

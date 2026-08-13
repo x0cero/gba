@@ -9,6 +9,18 @@ use std::sync::{Arc, Mutex};
 
 mod voxel;
 
+/// FNV-1a over a rendered frame: the determinism check compares hashes rather
+/// than storing two filmstrips.
+fn frame_hash(fb: &[u32]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &c in fb {
+        for b in c.to_le_bytes() {
+            h = (h ^ b as u64).wrapping_mul(0x1000_0000_01b3);
+        }
+    }
+    h
+}
+
 fn dump_frame(fb: &[u32], w: usize, h: usize, path: &str) {
     let mut out = format!("P3\n{w} {h}\n255\n");
     for px in fb {
@@ -140,6 +152,24 @@ fn main() -> ExitCode {
                 n += 1;
                 // GBA_DUMP_EVERY=K writes frameNNNNN.ppm into GBA_DUMP_DIR so
                 // one run gives a filmstrip to find where a picture goes wrong.
+                // GBA_3D_TRACE: render (but do not necessarily save) EVERY
+                // frame from GBA_DUMP_FROM on, so the regression harness sees a
+                // continuous per-frame record of the camera, the sprite anchors
+                // and the geometry rather than only the saved filmstrip frames.
+                if voxel::trace() && n >= dump_from
+                    && let (Some(cap), Some(dio)) = (&mut capture, &mut diorama)
+                {
+                    println!("FRAME {n}");
+                    cap.run(&cpu.bus.io, &cpu.bus.palette, &cpu.bus.vram, &cpu.bus.oam);
+                    let g = voxel::MapGrid::read(&cpu.bus);
+                    dio.render(cap, &cpu.bus.ppu.framebuffer, g.as_ref());
+                    if let Some(g) = &g
+                        && env::var("GBA_3D_GEOM").is_ok()
+                    {
+                        g.trace_geometry();
+                    }
+                    println!("SHA {:016x}", frame_hash(&dio.buffer));
+                }
                 if let Some(k) = dump_every
                     && k > 0
                     && n % k == 0
