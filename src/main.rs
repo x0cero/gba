@@ -161,7 +161,7 @@ fn main() -> ExitCode {
                 {
                     println!("FRAME {n}");
                     cap.run(&cpu.bus.io, &cpu.bus.palette, &cpu.bus.vram, &cpu.bus.oam);
-                    let g = voxel::MapGrid::read(&cpu.bus);
+                    let g = voxel::MapGrid::read(&cpu.bus, Some(cap));
                     dio.render(cap, &cpu.bus.ppu.framebuffer, g.as_ref());
                     if let Some(g) = &g
                         && env::var("GBA_3D_GEOM").is_ok()
@@ -179,7 +179,7 @@ fn main() -> ExitCode {
                     match (&mut capture, &mut diorama) {
                         (Some(cap), Some(dio)) => {
                             cap.run(&cpu.bus.io, &cpu.bus.palette, &cpu.bus.vram, &cpu.bus.oam);
-                            dio.render(cap, &cpu.bus.ppu.framebuffer, voxel::MapGrid::read(&cpu.bus).as_ref());
+                            dio.render(cap, &cpu.bus.ppu.framebuffer, voxel::MapGrid::read(&cpu.bus, Some(cap)).as_ref());
                             dump_frame(
                                 &dio.buffer,
                                 voxel::WIDTH,
@@ -214,7 +214,7 @@ fn main() -> ExitCode {
         match (&mut capture, &mut diorama) {
             (Some(cap), Some(dio)) => {
                 cap.run(&cpu.bus.io, &cpu.bus.palette, &cpu.bus.vram, &cpu.bus.oam);
-                dio.render(cap, &cpu.bus.ppu.framebuffer, voxel::MapGrid::read(&cpu.bus).as_ref());
+                dio.render(cap, &cpu.bus.ppu.framebuffer, voxel::MapGrid::read(&cpu.bus, Some(cap)).as_ref());
                 dump_frame(&dio.buffer, voxel::WIDTH, voxel::HEIGHT, "frame.ppm");
                 // GBA_BENCH: time capture + diorama render on the final frame.
                 if env::var("GBA_BENCH").is_ok() {
@@ -225,7 +225,7 @@ fn main() -> ExitCode {
                     let tc = t.elapsed() / 100;
                     let t = std::time::Instant::now();
                     for _ in 0..100 {
-                        dio.render(cap, &cpu.bus.ppu.framebuffer, voxel::MapGrid::read(&cpu.bus).as_ref());
+                        dio.render(cap, &cpu.bus.ppu.framebuffer, voxel::MapGrid::read(&cpu.bus, Some(cap)).as_ref());
                     }
                     eprintln!("capture avg: {:.2?}, render avg: {:.2?}", tc, t.elapsed() / 100);
                 }
@@ -234,7 +234,7 @@ fn main() -> ExitCode {
                 // red=blocked with brightness by height).
                 if env::var("GBA_GRID_DEBUG").is_ok() {
                     let mut dbg = cpu.bus.ppu.framebuffer;
-                    if let Some(g) = voxel::MapGrid::read(&cpu.bus) {
+                    if let Some(g) = voxel::MapGrid::read(&cpu.bus, None) {
                         for (i, px) in dbg.iter_mut().enumerate() {
                             let (x, y) = (i % ppu::WIDTH, i / ppu::WIDTH);
                             let tint = match g.cell_of_screen(x, y) {
@@ -505,7 +505,7 @@ fn main() -> ExitCode {
             match (&mut capture, &mut diorama) {
                 (Some(cap), Some(dio)) => {
                     cap.run(&cpu.bus.io, &cpu.bus.palette, &cpu.bus.vram, &cpu.bus.oam);
-                    dio.render(cap, &cpu.bus.ppu.framebuffer, voxel::MapGrid::read(&cpu.bus).as_ref());
+                    dio.render(cap, &cpu.bus.ppu.framebuffer, voxel::MapGrid::read(&cpu.bus, Some(cap)).as_ref());
                     presented.copy_from_slice(&dio.buffer);
                 }
                 _ => presented.copy_from_slice(&cpu.bus.ppu.framebuffer),

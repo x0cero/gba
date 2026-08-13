@@ -448,7 +448,7 @@ impl MapGrid {
     /// pointer; the grid is the LIVE map with a 7-cell border margin),
     /// gMapHeader (-> ROM map layout -> tilesets -> metatiles + attributes),
     /// gSaveBlock1Ptr (player map coordinates = camera).
-    pub fn read(bus: &Bus) -> Option<MapGrid> {
+    pub fn read(bus: &Bus, cap: Option<&Capture>) -> Option<MapGrid> {
         let rd8 = |a: u32| -> Option<u8> {
             match a >> 24 {
                 0x02 => bus.ewram.get((a as usize) & 0x3_FFFF).copied(),
@@ -507,9 +507,57 @@ impl MapGrid {
             eprintln!("grid: tsets {tprim:08X}/{tsec:08X} meta {mprim:08X}/{msec:08X} attr {aprim:08X}/{asec:08X}");
         }
 
+        // THE REAL MAP'S OWN SIZE, and which sides of it lead somewhere.
+        //
+        // The 7-cell margin around the live grid is two different things at
+        // once. On a side with a map connection it holds the NEIGHBOURING
+        // map's real cells, which is why walking to the south edge of Pallet
+        // shows Route 21 coming up. On a side with no connection it holds the
+        // map's border block, tiled: for an interior that is the black padding
+        // FireRed hides off the edge of a 240x160 screen, plus, at a door, the
+        // bottom half of the doormat repeated forever. Drawing it was the
+        // "duplicated mat fragment and black strip floating below the floor".
+        //
+        // MapLayout in FRLG: +0x00 width, +0x04 height, +0x08 border,
+        // +0x0C map, +0x10 primary tileset, +0x14 secondary tileset.
+        let (mapw, maph) = (rd32(layout)? as i32, rd32(layout + 4)? as i32);
+        if !(1..=1024).contains(&mapw) || !(1..=1024).contains(&maph) {
+            return None;
+        }
+        // MapHeader +0x0C -> {s32 count; MapConnection *list}, each entry 12
+        // bytes starting with the direction (1 south, 2 north, 3 west, 4 east).
+        let mut conn = 0u8;
+        if let Some(p) = rd32(0x0203_6DFC + 0x0C).filter(|&p| p >> 24 == 8 || p >> 24 == 9)
+            && let (Some(count), Some(list)) = (rd32(p), rd32(p + 4))
+            && list >> 24 == 8
+        {
+            for i in 0..count.min(16) {
+                if let Some(d) = rd8(list + i * 12)
+                    && (1..=4).contains(&d)
+                {
+                    conn |= 1 << d;
+                }
+            }
+        }
+        if dbg {
+            eprintln!("grid: map {mapw}x{maph} conn={conn:02X}");
+        }
         // Live grid entry: metatile id 0-9, collision 10-11, elevation 12-15.
         // VMap coordinates are map coordinates + 7 (the border margin).
         let entry = |gx: i32, gy: i32| -> Option<u16> {
+            // Outside the real map the cell only exists if a connection leads
+            // that way; a corner is beyond two edges at once and is always
+            // filler, so the diorama is cut cleanly at the map boundary.
+            let out_we = if gx < 0 { 3 } else if gx >= mapw { 4 } else { 0 };
+            let out_ns = if gy < 0 { 2 } else if gy >= maph { 1 } else { 0 };
+            if out_we != 0 && out_ns != 0 {
+                return None;
+            }
+            for d in [out_we, out_ns] {
+                if d != 0 && conn & 1 << d == 0 {
+                    return None;
+                }
+            }
             let (vx, vy) = (gx + 7, gy + 7);
             if vx < 0 || vy < 0 || vx >= vwidth || vy >= vheight {
                 return None; // past the live grid entirely: nothing to draw
@@ -537,6 +585,18 @@ impl MapGrid {
         // (7, 5); fine scroll from the ground layer's BG registers.
         let r16io = |off: usize| u16::from_le_bytes([bus.io[off], bus.io[off + 1]]);
         let (hofs, vofs) = ((r16io(0x18) & 0x1FF) as i32, (r16io(0x1A) & 0x1FF) as i32);
+        let src = ArtSource {
+            rom: &bus.rom,
+            vram: &bus.vram,
+            palette: &bus.palette,
+            meta: (mprim, msec),
+            // The map layers all share one char block; take it from the
+            // ground layer's control register rather than assuming zero.
+            char_base: ((r16io(0x0C) >> 2) & 3) as usize * 0x4000,
+        };
+        let art = std::cell::RefCell::new(Art::new());
+        let slot_of = |e: u16| -> usize { src.decode(&mut art.borrow_mut(), e) };
+
         // The camera has to be ONE continuous quantity. The player's map
         // coordinate is not it: FireRed snaps that to the destination cell on
         // the first frame of a step and then slides the hardware scroll there
@@ -567,6 +627,95 @@ impl MapGrid {
         if (camy - snap.1).abs() > 48 {
             camy = snap.1;
         }
+        // IS THIS THE OVERWORLD, AND WHERE IS THE CAMERA REALLY?
+        //
+        // Those are the same question, and the picture the PPU has just drawn
+        // answers it. If the camera is right then the metatile the map grid
+        // puts under a screen pixel is the colour the PPU drew there, so a
+        // candidate camera can be SCORED by sampling the background composite
+        // and counting agreements.
+        //
+        // That settles two separate bugs at once, and both were caused by
+        // assuming instead of measuring.
+        //
+        // FireRed does not always lock the camera to the player. It stops
+        // following near a map edge and during scripted movement while the
+        // player keeps walking, so a camera derived from the player's own
+        // coordinate is offset by exactly the amount the camera stopped
+        // following -- which is why the player and the NPCs beside him were
+        // drawn one or two rows off the floor, and why the offset picked up
+        // inside a building was still there after stepping outside. The
+        // best-scoring whole-cell offset IS the camera, remeasured every frame,
+        // so a warp resyncs on the first frame with no history to carry.
+        //
+        // And when nothing scores at all -- a battle, a full-screen menu, a
+        // summary screen -- the map grid still READS perfectly well but
+        // describes a map that is not the picture on the screen. Pointer
+        // validity cannot tell the difference; agreement with the drawn pixels
+        // can, and the honest answer is "no overworld here", which drops the
+        // frame to flat 2D exactly the way a battle always used to.
+        if let Some(cap) = cap.filter(|c| c.bg_frame.len() >= ppu::WIDTH * ppu::HEIGHT) {
+            let score = |cx: i32, cy: i32| -> (u32, u32) {
+                let (mut hit, mut n) = (0u32, 0u32);
+                for sy in (4..ppu::HEIGHT).step_by(10) {
+                    for sx in (4..ppu::WIDTH).step_by(10) {
+                        let (mx, my) = (cx + sx as i32 - 112, cy + sy as i32 - 80);
+                        let Some(e) = entry(mx.div_euclid(16), my.div_euclid(16)) else {
+                            continue;
+                        };
+                        let s = slot_of(e);
+                        let a = art.borrow().comp_at(
+                            s,
+                            mx.rem_euclid(16) as usize,
+                            my.rem_euclid(16) as usize,
+                        );
+                        n += 1;
+                        hit += (a == cap.bg_frame[sy * ppu::WIDTH + sx]) as u32;
+                    }
+                }
+                (hit, n)
+            };
+            // The fine scroll comes straight from the ground layer's own
+            // register and is never wrong, so only whole cells are searched.
+            let mut best = (score(camx, camy), 0i32, 0i32);
+            if best.0 .0 * 4 < best.0 .1 * 3 {
+                for r in 1..=3i32 {
+                    for dy in -r..=r {
+                        for dx in -r..=r {
+                            if dx.abs().max(dy.abs()) != r {
+                                continue;
+                            }
+                            let s = score(camx + dx * 16, camy + dy * 16);
+                            if s.0 * best.0 .1 > best.0 .0 * s.1 {
+                                best = (s, dx, dy);
+                            }
+                        }
+                    }
+                    if best.0 .0 * 4 >= best.0 .1 * 3 {
+                        break;
+                    }
+                }
+            }
+            let (hit, n) = best.0;
+            if std::env::var("GBA_3D_MATCH").is_ok() {
+                eprintln!(
+                    "match: {hit}/{n} = {:.2} offset ({},{})",
+                    hit as f32 / n.max(1) as f32,
+                    best.1,
+                    best.2
+                );
+            }
+            // Too little of the map falls on screen to judge (a tiny interior
+            // seen from its corner): trust the integrated camera. Otherwise a
+            // picture the map cannot explain is not the overworld.
+            if n >= 24 {
+                if hit * 100 < n * 40 {
+                    return None;
+                }
+                camx += best.1 * 16;
+                camy += best.2 * 16;
+            }
+        }
         CAM.with(|c| c.set(Some(Cam { hofs, vofs, x: camx, y: camy, map: grid_ptr })));
         let fine = (camx.rem_euclid(16) as usize, camy.rem_euclid(16) as usize);
         let (gx0, gy0) = (camx.div_euclid(16) - 7 - MX, camy.div_euclid(16) - 5 - MY_N);
@@ -574,17 +723,101 @@ impl MapGrid {
             eprintln!("cam: player=({px},{py}) scroll=({hofs},{vofs}) camera=({camx},{camy})");
         }
 
-        let src = ArtSource {
-            rom: &bus.rom,
-            vram: &bus.vram,
-            palette: &bus.palette,
-            meta: (mprim, msec),
-            // The map layers all share one char block; take it from the
-            // ground layer's control register rather than assuming zero.
-            char_base: ((r16io(0x0C) >> 2) & 3) as usize * 0x4000,
+        // FIRERED'S BLACK PADDING EDGE.
+        //
+        // An interior's map is a little bigger than its room: the outermost
+        // row or column is black filler the game keeps just off the bottom of
+        // a 240x160 screen. Most of those metatiles are wholly black and the
+        // all-black test already cuts them, but the ones under a doorway carry
+        // the bottom half of the doormat, so the diorama grew a duplicated mat
+        // fragment and a black strip hanging under the floor's south edge.
+        //
+        // A single half-lit tile cannot be judged on its own -- plenty of real
+        // scenery is dark. A whole EDGE of the map that is almost entirely
+        // black is unmistakable, so the test is made per edge, over the map's
+        // full width or height. That keeps the answer in map coordinates and
+        // therefore identical from every camera position, which the geometry
+        // check requires.
+        let dark_line = |horizontal: bool, at: i32| -> bool {
+            let n = if horizontal { mapw } else { maph };
+            let mut dark = 0;
+            for i in 0..n {
+                let (gx, gy) = if horizontal { (i, at) } else { (at, i) };
+                let d = entry(gx, gy).is_some_and(|e| {
+                    let s = slot_of(e);
+                    art.borrow().dark[s]
+                });
+                dark += d as i32;
+            }
+            dark * 4 >= n * 3
         };
-        let art = std::cell::RefCell::new(Art::new());
-        let slot_of = |e: u16| -> usize { src.decode(&mut art.borrow_mut(), e) };
+        // A WARP FADE IS NOT A BLACK MAP. Every palette on screen goes to
+        // black over about twenty frames when a door swallows the player, so
+        // for those frames every metatile decodes as black and the padding and
+        // doorway tests below would cut the entire world away, leaving the
+        // figures hanging over nothing. When the whole map reads black it is
+        // the lights going out, not padding, so nothing is cut.
+        let fading = {
+            let (mut dark, mut n) = (0, 0);
+            let mut gy = 0;
+            while gy < maph {
+                let mut gx = 0;
+                while gx < mapw {
+                    n += 1;
+                    dark += entry(gx, gy).is_none_or(|e| {
+                        let s = slot_of(e);
+                        art.borrow().dark[s]
+                    }) as i32;
+                    gx += 4;
+                }
+                gy += 4;
+            }
+            dark * 10 >= n * 9
+        };
+        let edge_dark = [
+            dark_line(true, 0),
+            dark_line(true, maph - 1),
+            dark_line(false, 0),
+            dark_line(false, mapw - 1),
+        ];
+        let padding = |gx: i32, gy: i32| -> bool {
+            if fading {
+                return false;
+            }
+            (gy == 0 && edge_dark[0])
+                || (gy == maph - 1 && edge_dark[1])
+                || (gx == 0 && edge_dark[2])
+                || (gx == mapw - 1 && edge_dark[3])
+        };
+        let is_dark = |gx: i32, gy: i32| -> bool {
+            entry(gx, gy).is_none_or(|e| {
+                let s = slot_of(e);
+                art.borrow().dark[s]
+            }) || padding(gx, gy)
+        };
+        // A BLACK CELL IS ONLY THE VOID WHEN IT IS SURROUNDED BY BLACK.
+        //
+        // FireRed pads the space around an interior with black metatiles, and
+        // cutting those out is what lets a room read as an island rather than
+        // as a floor slab in a black box. But an OPEN DOOR is a black metatile
+        // too, in the middle of a building's front. Cutting it punched a hole
+        // through the wall, and the cell behind the hole then showed its own
+        // south face full height: the "giant dark slab hanging from the
+        // roofline" that appeared the moment a door started to open. Real
+        // padding comes in fields, a doorway is one black cell in a wall, so
+        // the test is on the neighbourhood, not on the cell.
+        let blackout = |gx: i32, gy: i32| -> bool {
+            if fading || !is_dark(gx, gy) {
+                return false;
+            }
+            let mut n = 0;
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    n += ((dx != 0 || dy != 0) && is_dark(gx + dx, gy + dy)) as i32;
+                }
+            }
+            n >= 5
+        };
 
         // What KIND of thing a blocked cell holds decides its geometry, and
         // the answer has to come from the metatile's own artwork, not from how
@@ -592,15 +825,15 @@ impl MapGrid {
         // and a house wall are both tall runs of blocked cells; extruding both
         // is what turned Pallet's tree line into a smeared hedge.
         let kind = |gx: i32, gy: i32| -> Kind {
+            if blackout(gx, gy) {
+                return Kind::Open;
+            }
             let Some(e) = entry(gx, gy) else { return Kind::Open };
             if e >> 10 & 3 == 0 || is_water(e) {
                 return Kind::Open;
             }
             let s = slot_of(e);
             let a = art.borrow();
-            if a.dark[s] {
-                return Kind::Open;
-            }
             if a.leaf[s] {
                 return Kind::Plant;
             }
@@ -733,7 +966,7 @@ impl MapGrid {
                 let slot = slot_of(e) as u32;
                 // Black padding metatiles are not scenery, they are the void
                 // the game hides off the edge of a 240x160 screen.
-                if art.borrow().dark[slot as usize] {
+                if blackout(gx, gy) {
                     cells.push(Cell::Void);
                     slots.push(slot);
                     height.push(0.0);
@@ -761,13 +994,22 @@ impl MapGrid {
                 slots.push(slot);
             }
         }
-        // Whatever the player is standing on is never a volume: FireRed lets
-        // him stand in a doorway or on a warp mat, and extruding that cell
-        // wrapped him in a box. His own cell is always floor.
+        // Whatever the player is standing on is never a lone volume: FireRed
+        // lets him stand on a warp mat or a stair tile, and extruding that one
+        // cell wrapped him in a box.
+        //
+        // A cell inside a BIGGER volume is a different matter, and flattening
+        // it was the door-opening bug. Walking into a door puts him on a cell
+        // in the middle of the building's front; zeroing that cell's height
+        // punched a hole through the wall, and the cell behind the hole then
+        // showed its own full-height side, which is the "giant dark slab
+        // hanging from the roofline". The building stays whole, and he walks
+        // into the doorway and out of sight exactly as he does in the game.
         let (pcx, pcy) = (px - gx0, py - gy0);
         if (0..Self::COLS as i32).contains(&pcx) && (0..Self::ROWS as i32).contains(&pcy) {
             let i = pcy as usize * Self::COLS + pcx as usize;
-            if cells[i] != Cell::Void {
+            let lone = !matches!(cells[i], Cell::Void | Cell::Block { n: 2.., .. });
+            if lone {
                 cells[i] = Cell::Flat;
                 height[i] = 0.0;
             }
@@ -808,7 +1050,10 @@ impl MapGrid {
             }
         }
         if trace() {
-            eprintln!("TRACE cam {camx} {camy} fine {} {} gx0 {gx0} gy0 {gy0} player {px} {py}", fine.0, fine.1);
+            eprintln!(
+                "TRACE cam {camx} {camy} fine {} {} gx0 {gx0} gy0 {gy0} player {px} {py} map {mapw} {maph}",
+                fine.0, fine.1
+            );
         }
         Some(MapGrid {
             fine,
@@ -900,6 +1145,12 @@ impl MapGrid {
     pub fn world_of_map(&self, mx: i32, my: i32) -> (f32, f32) {
         let (camx, camy) = self.camera();
         ((mx - camx - 8) as f32, (80 - (my - camy + 80)) as f32)
+    }
+
+    /// The cell a map-pixel position falls in. `Void` means the diorama draws
+    /// no floor there, so a figure anchored to it is standing in mid-air.
+    pub fn cell_at_map(&self, mx: i32, my: i32) -> Cell {
+        self.at(mx.div_euclid(16) - self.gx0, my.div_euclid(16) - self.gy0)
     }
 
     /// Ground height at a map-pixel position: the cell's own elevation, except
@@ -1545,12 +1796,36 @@ impl Renderer {
                 // where a billboard should stand.
                 measured
             };
+            // THE GAME'S OWN COORDINATE IS THE LAST WORD ON WHERE HE IS.
+            //
+            // Everything above is measured off the picture, which is right
+            // almost always and useless for the twenty frames of a warp fade,
+            // where the sprite of the map being LEFT is still on screen over
+            // the map being entered. So when the measurement disagrees with
+            // gSaveBlock1Ptr by more than the one cell a walking step is worth,
+            // the measurement is thrown away: the player is drawn on the cell
+            // the game says he is standing on, never in the void beside it.
+            let (ax, ay) = if player
+                && ((ax.div_euclid(16) - mgrid.player.0).abs() > 1
+                    || ((ay - 8).div_euclid(16) - mgrid.player.1).abs() > 1)
+            {
+                (mgrid.player.0 * 16 + 8, mgrid.player.1 * 16 + 16)
+            } else {
+                (ax, ay)
+            };
+            // A figure with no floor under it is not standing anywhere. During
+            // a warp the outgoing map's characters are still being drawn over
+            // the incoming map, and planting them on its void is exactly the
+            // "NPC floating off the edge" report.
+            if !player && mgrid.cell_at_map(ax, ay - 8) == Cell::Void {
+                continue;
+            }
             let ground = mgrid.ground_at_map(ax, ay - 8);
             let (_, wz0) = mgrid.world_of_map(ax, ay);
             let wx0 = world(min_x, feet, 0.0).0;
             if trace() {
                 println!(
-                    "FIG {fig} box {min_x} {max_x} {feet} mappix {mpx} {mpy} anchor {ax} {ay} cell {ccx2} {ccy2} ground {ground} wz {wz0} gamecell {gcx} {gcy} player {isp}",
+                    "FIG {fig} box {min_x} {max_x} {feet} mappix {mpx} {mpy} anchor {ax} {ay} cell {ccx2} {ccy2} ground {ground} wz {wz0} gamecell {gcx} {gcy} player {isp} void {void}",
                     mpx = measured.0,
                     mpy = measured.1,
                     ccx2 = ax.div_euclid(16),
@@ -1558,6 +1833,7 @@ impl Renderer {
                     gcx = mgrid.player.0,
                     gcy = mgrid.player.1,
                     isp = player as u8,
+                    void = (mgrid.cell_at_map(ax, ay - 8) == Cell::Void) as u8,
                 );
             }
 

@@ -20,6 +20,14 @@ Checks:
   determin   the same scenario run twice produces identical frame hashes.
   geometry   the same map cells seen from two camera positions produce
              identical geometry.
+  interior   walking into Oak's lab and back out again: the player's rendered
+             anchor cell equals the game's own coordinate on every frame,
+             including the two warp transitions, no drawn figure is anchored
+             outside the map or over a cell the diorama leaves empty, and the
+             frame hashes are reproducible.
+  fallback   a full-screen menu is not the overworld, so it must render as
+             flat 2D (no map grid at all) even though the map pointers in RAM
+             still read perfectly well.
 
 Usage:  python3 tools/regress3d.py [--rom /tmp/rom.gba] [--only NAME]
 Exit code is 0 only when every check passes.
@@ -37,13 +45,35 @@ PREFIX = ("420-424:start,480-484:a,540-544:a,600-604:a,660-664:a,930-934:a,"
           "1230-1234:a,1290-1294:a,1350-1354:a,1410-1414:a")
 LIVE = 1500
 
+# Walk from where the save drops the player round to the front of Oak's lab,
+# in through the door (warp at about frame 2570), stand inside, then walk back
+# out through the same door (warp back at about frame 2717) and away from it.
+# Interiors are where every assumption that the camera is locked to the player
+# and that the live grid's border margin is scenery falls apart, so this is the
+# scenario that has to hold.
+ENTER = ("1520-1555:left,1570-1680:down,1700-1800:left,1810-1930:down,"
+         "1950-2060:right,2080-2160:up,2180-2230:down,2250-2330:right,"
+         "2350-2420:up,2440-2458:left,2480-2560:up")
+EXIT = "2700-2760:down,2800-2860:up,2900-2960:left"
+INSIDE = (2600, 2700)
+# Frames spent in a warp fade, where the PPU still shows sprites belonging to
+# the map that is being left. Anchors are checked there too, but "is there
+# floor under this figure" only makes sense once a map has settled.
+SETTLE = 24
+
+# Opens the START menu and walks into the trainer card, a full-screen menu
+# that replaces the overworld while gBackupMapLayout still points at a
+# perfectly valid Pallet Town.
+MENU = "1520-1524:start,1580-1584:down,1640-1644:a,1760-1764:a"
+MENU_OPEN = (1790, 1900)
+
 
 class Frame:
-    __slots__ = ("n", "cam", "fine", "player", "figs", "sha", "geom")
+    __slots__ = ("n", "cam", "fine", "player", "figs", "sha", "geom", "mapsize")
 
     def __init__(self, n):
         self.n = n
-        self.cam = self.fine = self.player = self.sha = None
+        self.cam = self.fine = self.player = self.sha = self.mapsize = None
         self.figs = []
         self.geom = {}
 
@@ -85,11 +115,14 @@ def parse(text):
             cur.cam = (int(f[2]), int(f[3]))
             cur.fine = (int(f[5]), int(f[6]))
             cur.player = (int(f[12]), int(f[13]))
+            if len(f) >= 17:
+                cur.mapsize = (int(f[15]), int(f[16]))
         elif f[0] == "FIG":
             m = re.match(
                 r"FIG (\d+) box (\S+) (\S+) (\S+) mappix (-?\d+) (-?\d+) "
                 r"anchor (-?\d+) (-?\d+) cell (-?\d+) (-?\d+) ground (\S+) "
-                r"wz (\S+) gamecell (-?\d+) (-?\d+) player (\d)", line)
+                r"wz (\S+) gamecell (-?\d+) (-?\d+) player (\d) void (\d)",
+                line)
             if m:
                 g = m.groups()
                 cur.figs.append(dict(
@@ -97,7 +130,7 @@ def parse(text):
                     anchor=(int(g[6]), int(g[7])),
                     cell=(int(g[8]), int(g[9])), ground=float(g[10]),
                     wz=float(g[11]), gamecell=(int(g[12]), int(g[13])),
-                    player=g[14] == "1"))
+                    player=g[14] == "1", void=g[15] == "1"))
         elif f[0] == "SHA":
             cur.sha = f[1]
         elif f[0] == "GEOM":
@@ -175,6 +208,86 @@ def check_ground(frames, lo, hi):
     return bad[:5], f"{len(bad)} frames on water"
 
 
+def settled(frames):
+    """Frames whose map has been the same one for SETTLE frames: everything
+    outside those windows is a warp fade, where the PPU is still drawing
+    sprites that belong to the map being left."""
+    out, since = [], None
+    last = object()
+    for f in frames:
+        if f.mapsize != last:
+            last, since = f.mapsize, f.n
+        if f.mapsize and f.n - since >= SETTLE:
+            out.append(f)
+    return out
+
+
+def check_figures(frames):
+    """No drawn figure stands outside the map, and once a map has settled none
+    of them stands over a cell the diorama leaves empty. Both were the same
+    bug: the player and the NPCs beside him drawn one or two rows off the
+    floor, hanging in the black void south and east of an interior."""
+    bad, off, floating = [], 0, 0
+    for f in frames:
+        if not f.mapsize:
+            continue
+        w, h = f.mapsize
+        for g in f.figs:
+            cx, cy = g["cell"]
+            if not (0 <= cx < w and 0 <= cy < h):
+                off += 1
+                if len(bad) < 5:
+                    bad.append(f"frame {f.n}: figure {g['idx']} at cell "
+                               f"{g['cell']}, map is {w}x{h}")
+    for f in settled(frames):
+        for g in f.figs:
+            if g["void"]:
+                floating += 1
+                if len(bad) < 5:
+                    bad.append(f"frame {f.n}: figure {g['idx']} at cell "
+                               f"{g['cell']} has no floor under it")
+    n = sum(len(f.figs) for f in frames)
+    return bad, f"{n} figures drawn, {off} outside the map, {floating} floating"
+
+
+def check_warps(frames):
+    """A warp must resync the anchor, not carry the old map's offset into the
+    new one: within SETTLE frames of every map change the player's anchor cell
+    must be the game's own coordinate exactly."""
+    bad, warps = [], 0
+    last = object()
+    since = 0
+    for f in frames:
+        if f.mapsize != last:
+            last, since, warps = f.mapsize, f.n, warps + 1
+        g = player_fig(f)
+        if not g or f.n - since < SETTLE or not f.mapsize:
+            continue
+        dx = g["cell"][0] - g["gamecell"][0]
+        dy = g["cell"][1] - g["gamecell"][1]
+        if abs(dx) > 1 or abs(dy) > 1:
+            bad.append(f"frame {f.n} ({f.n - since} after a map change): "
+                       f"anchor {g['cell']} vs game {g['gamecell']}")
+    return bad[:5], f"{warps - 1} map changes, {len(frames)} frames"
+
+
+def check_flat(frames, lo, hi, want):
+    """`want` True: these frames are the overworld and must build a diorama.
+    False: they are not, and must fall through to flat 2D, which shows up as
+    no map grid being accepted for the frame at all."""
+    win = [f for f in frames if lo <= f.n <= hi]
+    got = [f for f in win if f.cam]
+    if not win:
+        return ["no frames in the window"], "n/a"
+    if want and len(got) < len(win):
+        return [f"{len(win) - len(got)} of {len(win)} frames had no map grid"], \
+            "diorama expected"
+    if not want and got:
+        return [f"{len(got)} of {len(win)} frames still built a diorama, "
+                f"first at frame {got[0].n}"], "flat 2D expected"
+    return [], f"{len(win)} frames, {len(got)} with a diorama"
+
+
 def check_determinism(a, b):
     sa = [(f.n, f.sha) for f in a]
     sb = [(f.n, f.sha) for f in b]
@@ -222,6 +335,34 @@ def main():
             report("walk.ground", *check_ground(fr, 1500, 1620))
         if want("bump"):
             report("bump.stable", *check_bump(fr, 1560, 1615))
+
+    if want("interior"):
+        # One run all the way in and back out: two warps, an interior with
+        # NPCs standing near its south and east edges, and the door animation
+        # in between.
+        fr = run(args.binary, args.rom, ENTER + "," + EXIT, 3000,
+                 dump_from=2400)
+        # A warp fade is a black screen with the outgoing map's sprites still
+        # on it, so the anchor is only meaningful once a map has settled;
+        # interior.warp below is what pins down the transition itself.
+        report("interior.anchor", *check_anchor(settled(fr), 2400, 3000))
+        report("interior.figures", *check_figures(fr))
+        report("interior.warp", *check_warps(fr))
+        report("interior.inside",
+               *check_flat(fr, INSIDE[0], INSIDE[1], True))
+        b = run(args.binary, args.rom, ENTER + "," + EXIT, 3000,
+                dump_from=2400)
+        report("interior.determinism", *check_determinism(fr, b))
+
+    if want("fallback"):
+        # A full-screen menu leaves gBackupMapLayout and gSaveBlock1Ptr
+        # pointing at a perfectly good Pallet Town, so pointer validity cannot
+        # tell it from the overworld; only agreement with the pixels the PPU
+        # actually drew can.
+        fr = run(args.binary, args.rom, MENU, 1900, dump_from=LIVE)
+        report("fallback.overworld", *check_flat(fr, 1500, 1515, True))
+        report("fallback.menu",
+               *check_flat(fr, MENU_OPEN[0], MENU_OPEN[1], False))
 
     if want("determin"):
         a = run(args.binary, args.rom, "1520-1560:down", 1560)
