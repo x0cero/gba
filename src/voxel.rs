@@ -81,10 +81,21 @@ const META_ROW: u16 = 8;
 const STEP: f32 = 16.0;
 /// Water sits below ground so shorelines get a lip.
 const WATER: f32 = -3.0;
-/// How much taller than its map footprint a whole tree stands. Top-down art
-/// foreshortens a tree badly; standing the complete graphic up at 1:1 gives a
-/// squat shrub, and real dioramas stretch it a little.
-const TREE_TALL: f32 = 1.0;
+/// How tall a tree stands, as a fraction of its own artwork.
+///
+/// A tree is a screen-facing billboard, so its height is spent in SCREEN
+/// pixels, while the ground it stands on is foreshortened: two map rows of
+/// tree measure 32 pixels of picture but only 32 * sin(pitch) = 18 pixels of
+/// ground. At 1:1 every tree therefore reached 14 pixels into the tree behind
+/// it and ate its trunk and the shaded ring under its canopy. Along the north
+/// edge of a map that is invisible, because you look at one row of trees with
+/// grass in front of it; along the WEST edge the tree line runs away from the
+/// camera, so every tree was standing behind another one, nothing but pointed
+/// canopy tops survived, and the whole column merged into one flat green
+/// texture. Three quarters is what leaves the base of each tree showing, so a
+/// receding line reads as separate trees, and it still stands a tree half
+/// again as tall as the ground it covers.
+const TREE_TALL: f32 = 0.75;
 
 #[inline]
 fn rgb555(c: u16) -> u32 {
@@ -925,11 +936,27 @@ impl MapGrid {
             };
             (k == Kind::Plant).then(|| entry(gx, gy).unwrap_or(0) & 0x3FF)
         };
+        // Is the cell to the east the SAME tree unit continuing, one metatile
+        // to the right? Inside a tree drawn as a run of consecutive ids the
+        // answer is simply id+1. FireRed's map borders are not that tidy: the
+        // west tree column of an outdoor map pairs the left half of one tree
+        // graphic (0x014/0x01C) with the right half of a DIFFERENT one
+        // (0x017/0x01F), because the border art is built to overlap. Requiring
+        // id+1 split every one of those trees into two 16-pixel slivers, each
+        // stood up on its own, which is why the west border read as flat
+        // tiles instead of trees. Metatiles in the image are laid out in 2x2
+        // blocks, so a tree's left half always sits on an even column and its
+        // right half on the odd column beside it: an even id followed by an
+        // odd one in the same image row is the same tree continuing, whatever
+        // the gap between the two ids.
+        let hstep = |west: u16, east: u16| -> bool {
+            west + 1 == east || (west & 1 == 0 && east & 1 == 1 && west >> 3 == east >> 3)
+        };
         let unit = |cx: i32, cy: i32| -> (i32, i32, u8, u8) {
             let (gx, gy) = (gx0 + cx, gy0 + cy);
             let (mut ax, mut ay) = (gx, gy);
             while gx - ax < 3
-                && plant_id(ax - 1, ay).zip(plant_id(ax, ay)).is_some_and(|(w, c)| w + 1 == c)
+                && plant_id(ax - 1, ay).zip(plant_id(ax, ay)).is_some_and(|(w, c)| hstep(w, c))
             {
                 ax -= 1;
             }
@@ -944,7 +971,7 @@ impl MapGrid {
             while w < 4
                 && plant_id(ax + w, ay)
                     .zip(plant_id(ax + w - 1, ay))
-                    .is_some_and(|(e, c)| e == c + 1)
+                    .is_some_and(|(e, c)| hstep(c, e))
             {
                 w += 1;
             }
