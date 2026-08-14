@@ -879,12 +879,27 @@ impl MapGrid {
                 return Kind::Open;
             }
             let s = slot_of(e);
-            let a = art.borrow();
-            if a.leaf[s] {
+            if art.borrow().leaf[s] {
                 return Kind::Plant;
             }
-            let thin_ns = !solid(gx, gy - 1) && !solid(gx, gy + 1);
-            let thin_we = !solid(gx - 1, gy) && !solid(gx + 1, gy);
+            // "Thin" asks whether this cell is one cell of a LINE of built
+            // stuff -- a fence, a pond rim, a ledge -- and the question is
+            // only about built neighbours. A plant beside it is a billboard
+            // of its own and never part of a volume, so counting it as a
+            // neighbour is what made the fence down the west side of Pallet's
+            // pond, which runs right along the border tree column, look
+            // thick: it lost Thin, was extruded a step high and wore its own
+            // top-down art as a lid, which is the ladder of rungs.
+            let built = |gx: i32, gy: i32| -> bool {
+                solid(gx, gy)
+                    && entry(gx, gy).is_some_and(|e| {
+                        let s = slot_of(e);
+                        !art.borrow().leaf[s]
+                    })
+            };
+            let thin_ns = !built(gx, gy - 1) && !built(gx, gy + 1);
+            let thin_we = !built(gx - 1, gy) && !built(gx + 1, gy);
+            let a = art.borrow();
             if a.cover[s] > 0.05 && a.cover[s] < 0.75 && (thin_ns || thin_we) {
                 return Kind::Thin;
             }
