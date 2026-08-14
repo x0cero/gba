@@ -1874,11 +1874,40 @@ impl Renderer {
             }
             i
         }
+        // THE BLADES OF TALL GRASS ARE PART OF THE PERSON STANDING IN THEM.
+        //
+        // FireRed draws the half-hidden-in-the-grass look with a SPRITE: a
+        // separate object, exactly as wide as the character and sitting over
+        // his lower half, whose pixels beat his in the compositor. So walking
+        // into grass split the character into two figures, and neither was
+        // him: what was left of his own object ended at his waist, which put
+        // its foot line -- and therefore its billboard and its shadow -- half
+        // a cell north of where he stands, while the blades became a figure of
+        // their own that stood UP as a billboard one row in front of him and
+        // hid what remained. That is the "the grass swallows him" report.
+        //
+        // The blades belong to the figure they are drawn over, so they are
+        // merged into him and the pair is one billboard again, showing exactly
+        // what the game shows: a boy in grass up to his waist. The rule can
+        // only ever catch this case -- the two boxes must be the same column of
+        // the screen to within a pixel or two AND touch AND the upper one must
+        // have its feet in tall grass -- because a second character standing
+        // one cell south is a whole sixteen pixels down and his box does not
+        // touch at all.
+        let foot_cell = |b: [i32; 4]| {
+            let cx = ((b[0] + b[1]) / 2).clamp(0, W as i32 - 1) as usize;
+            let cy = b[3].clamp(0, ppu::HEIGHT as i32 - 1) as usize;
+            let (mx, my) = mgrid.map_pixel(cx, cy);
+            mgrid.cell_at_map(mx, my)
+        };
         for a in 0..boxes.len() {
             for b in 0..a {
                 let (p, q) = (boxes[a], boxes[b]);
                 let overlap = p[0] <= q[1] && q[0] <= p[1] && p[2] <= q[3] && q[2] <= p[3];
-                if overlap && (p[3] - q[3]).abs() <= 4 {
+                let same_column = (p[0] - q[0]).abs() <= 2 && (p[1] - q[1]).abs() <= 2;
+                let upper = if p[3] < q[3] { p } else { q };
+                let in_grass = same_column && foot_cell(upper) == Cell::Grass;
+                if overlap && ((p[3] - q[3]).abs() <= 4 || in_grass) {
                     let (ra, rb) = (root(&mut find, a), root(&mut find, b));
                     find[ra] = rb;
                 }
