@@ -2143,15 +2143,40 @@ impl Renderer {
             //
             // He is as wide as his cell, so the probe is as wide as he is:
             // the cell under each of his shoulders as well as under his feet.
-            let behind_volume = player
-                && (1..=3).any(|d| {
+            //
+            // AND IT IS ASKED FROM BOTH OF THE TWO PLACES HE IS AT ONCE.
+            //
+            // The anchor rides the camera, which is continuous and matches his
+            // pixels, but only reaches the cell he is walking into when the
+            // step FINISHES; gSaveBlock1Ptr names that cell on the step's first
+            // frame and holds it. So during the sixteen frames of a step the
+            // two disagree, and asking either one alone is wrong for part of
+            // every step: the camera cell is a step behind when he walks into a
+            // building's shadow (the roof is already clipping his feet while
+            // the probe still says the way is clear -- measured at up to eighty
+            // clipped pixels for four frames before the cutout came up, the
+            // "he is on the roof for a frame or two" report), and the game cell
+            // is a step ahead when he walks out of it (the roof still covers
+            // him while the probe already says he is clear).
+            //
+            // Either cell naming a volume is enough. The cutout then comes up
+            // on the first frame anything can occlude him and stays up until
+            // both agree he is past it, and since it only ever repaints pixels
+            // that something really is covering, holding it a frame longer than
+            // needed changes nothing on screen.
+            let probe = |cx: i32, cy: i32| {
+                (1..=3).any(|d| {
                     [-12, 0, 12].iter().any(|&sx| {
                         matches!(
-                            mgrid.cell_at_map(ax + sx, ay - 8 + d * 16),
+                            mgrid.cell_at_map(cx + sx, cy + d * 16),
                             Cell::Block { h, .. } if h > 0.0
                         )
                     })
-                });
+                })
+            };
+            let behind_volume = player
+                && (probe(ax, ay - 8)
+                    || probe(mgrid.player.0 * 16 + 8, mgrid.player.1 * 16 + 8));
             let center_dist =
                 (ccx - ppu::WIDTH as f32 / 2.0).abs() + (feet - ppu::HEIGHT as f32 / 2.0).abs();
             let hidden = self.cov - self.vis;
