@@ -2139,9 +2139,16 @@ impl Renderer {
             ];
             let (bw, bh) = (max_x - min_x, hart);
             let mut sampler = |u: f32, v: f32| {
-                let sx = (min_x + (u * bw).min(bw - 0.5)) as usize;
-                let sy = (top + (v * bh).min(bh - 0.5)) as usize;
-                let i = sy.min(ppu::HEIGHT - 1) * W + sx.min(W - 1);
+                let sxf = min_x + (u * bw).min(bw - 0.5);
+                let syf = top + (v * bh).min(bh - 0.5);
+                // The box was widened to the OAM extents, so part of it can lie
+                // past the frame edge where the PPU drew nothing. Those samples
+                // are transparent; clamping them back inside repeated the one
+                // drawn row down the whole quad (the edge-of-screen smear).
+                if sxf < 0.0 || syf < 0.0 || sxf >= W as f32 || syf >= ppu::HEIGHT as f32 {
+                    return SKIP;
+                }
+                let i = syf as usize * W + sxf as usize;
                 // Only this figure's own pixels: the quads of two characters
                 // standing side by side overlap, and without the mask each
                 // would paint bits of the other at its own depth.
