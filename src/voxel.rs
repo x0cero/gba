@@ -398,6 +398,7 @@ pub struct MapGrid {
     pub gx0: i32,
     pub gy0: i32,
     pub player: (i32, i32),
+    pub mapsize: (i32, i32),
     pub cells: Vec<Cell>,
     /// Art slot per cell.
     slots: Vec<u32>,
@@ -592,31 +593,57 @@ impl MapGrid {
         if dbg {
             eprintln!("grid: map {mapw}x{maph} conn={conn:02X}");
         }
+        // FRLG border block: 4x4 metatiles tiled past every unconnected edge.
+        let border = rd32(layout + 8)
+            .filter(|&p| p >> 24 == 8 || p >> 24 == 9)
+            .map(|border_ptr| {
+                let mut b = [0u16; 16];
+                for i in 0..16 {
+                    b[i] = rd16(border_ptr + i as u32 * 2).unwrap_or(0x3FF);
+                }
+                b
+            });
         // Live grid entry: metatile id 0-9, collision 10-11, elevation 12-15.
         // VMap coordinates are map coordinates + 7 (the border margin).
         let entry = |gx: i32, gy: i32| -> Option<u16> {
-            // Outside the real map the cell only exists if a connection leads
-            // that way; a corner is beyond two edges at once and is always
-            // filler, so the diorama is cut cleanly at the map boundary.
             let out_we = if gx < 0 { 3 } else if gx >= mapw { 4 } else { 0 };
             let out_ns = if gy < 0 { 2 } else if gy >= maph { 1 } else { 0 };
-            if out_we != 0 && out_ns != 0 {
-                return None;
-            }
-            for d in [out_we, out_ns] {
-                if d != 0 && conn & 1 << d == 0 {
-                    return None;
+            let outside = out_we != 0 || out_ns != 0;
+            if !outside {
+                let (vx, vy) = (gx + 7, gy + 7);
+                if vx >= 0 && vy >= 0 && vx < vwidth && vy < vheight {
+                    let e = rd16(grid_ptr + ((vy * vwidth + vx) * 2) as u32);
+                    if let Some(e) = e.filter(|&e| e & 0x3FF != 0x3FF) {
+                        return Some(e);
+                    }
                 }
             }
-            let (vx, vy) = (gx + 7, gy + 7);
-            if vx < 0 || vy < 0 || vx >= vwidth || vy >= vheight {
-                return None; // past the live grid entirely: nothing to draw
+            // On a connected side the live grid already carries the
+            // neighbour's cells; use them if they exist.
+            if outside {
+                let has_conn = [out_we, out_ns].iter().all(|&d| d == 0 || conn & 1 << d != 0);
+                if has_conn && !(out_we != 0 && out_ns != 0) {
+                    let (vx, vy) = (gx + 7, gy + 7);
+                    if vx >= 0 && vy >= 0 && vx < vwidth && vy < vheight {
+                        let e = rd16(grid_ptr + ((vy * vwidth + vx) * 2) as u32);
+                        if let Some(e) = e.filter(|&e| e & 0x3FF != 0x3FF) {
+                            return Some(e);
+                        }
+                    }
+                }
             }
-            // Metatile id 0x3FF is FireRed's MAPGRID_UNDEFINED: the parts of
-            // the margin with no map connection behind them. The game never
-            // draws those, and decoding one reads past the metatile table and
-            // produces garbage.
-            rd16(grid_ptr + ((vy * vwidth + vx) * 2) as u32).filter(|&e| e & 0x3FF != 0x3FF)
+            // Past the live grid or on an unconnected edge: tile the border
+            // block. This is what the real game draws past the map boundary
+            // (trees around Pallet Town, darkness around interiors).
+            if let Some(b) = border {
+                let bx = gx.rem_euclid(4) as usize;
+                let by = gy.rem_euclid(4) as usize;
+                let e = b[by * 4 + bx];
+                if e & 0x3FF != 0x3FF {
+                    return Some(e);
+                }
+            }
+            None
         };
         let attrs = |e: u16| -> u32 {
             let m = (e & 0x3FF) as u32;
@@ -1162,6 +1189,7 @@ impl MapGrid {
             gx0,
             gy0,
             player: (px, py),
+            mapsize: (mapw, maph),
             cells,
             slots,
             height,
@@ -2125,9 +2153,18 @@ impl Renderer {
             // A figure with no floor under it is not standing anywhere. During
             // a warp the outgoing map's characters are still being drawn over
             // the incoming map, and planting them on its void is exactly the
-            // "NPC floating off the edge" report.
-            if !player && mgrid.cell_at_map(ax, ay - 8) == Cell::Void {
-                continue;
+            // "NPC floating off the edge" report. Border cells past the real
+            // map have floor now but are still not a place a character stands.
+            if !player {
+                let (cx, cy) = (ax.div_euclid(16), (ay - 8).div_euclid(16));
+                if mgrid.cell_at_map(ax, ay - 8) == Cell::Void
+                    || cx < 0
+                    || cy < 0
+                    || cx >= mgrid.mapsize.0
+                    || cy >= mgrid.mapsize.1
+                {
+                    continue;
+                }
             }
             let ground = mgrid.ground_at_map(ax, ay - 8);
             let (_, wz0) = mgrid.world_of_map(ax, ay);
