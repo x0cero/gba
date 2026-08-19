@@ -437,6 +437,10 @@ struct Cam {
 
 thread_local! {
     static CAM: std::cell::Cell<Option<Cam>> = const { std::cell::Cell::new(None) };
+    // A sample of the ground layer's tile art, kept from frame to frame. See
+    // the tileset-swap check below for why it exists.
+    static ART_SNAP: std::cell::RefCell<(usize, Vec<u32>, u8)> =
+        const { std::cell::RefCell::new((usize::MAX, Vec::new(), 0)) };
 }
 
 /// Southern rows of a built volume that stand up as its front (GBA_3D_WALL,
@@ -700,6 +704,54 @@ impl MapGrid {
         // validity cannot tell the difference; agreement with the drawn pixels
         // can, and the honest answer is "no overworld here", which drops the
         // frame to flat 2D exactly the way a battle always used to.
+        // A TILESET BEING SWAPPED UNDER US IS NOT THE OVERWORLD EITHER.
+        //
+        // On the first frame of a battle transition the game has already
+        // uploaded the battle tile art while the overworld tilemaps are still
+        // in place. The pixel-agreement score below cannot catch that frame:
+        // it compares the map's prediction against the drawn picture, but both
+        // are rendered from the same swapped-out art, so garbage agrees with
+        // garbage and a frame of battle-font terrain flashed by. Overworld play
+        // only ever rewrites a sliver of the char block (water and flower
+        // animations), so a frame where most of it changed at once is a scene
+        // change, and honesty is a frame of plain 2D.
+        {
+            let words: Vec<u32> = (0..2048)
+                .map(|i| {
+                    let a = src.char_base + i * 16;
+                    u32::from_le_bytes(bus.vram[a..a + 4].try_into().unwrap())
+                })
+                .collect();
+            let swapped = ART_SNAP.with(|s| {
+                let mut s = s.borrow_mut();
+                let same_base = s.0 == src.char_base && s.1.len() == words.len();
+                let changed = if same_base {
+                    s.1.iter().zip(&words).filter(|(a, b)| a != b).count()
+                } else {
+                    0
+                };
+                if std::env::var("GBA_3D_SWAPLOG").is_ok() {
+                    eprintln!(
+                        "swap: {changed}/2048 art words changed base {:x} same {same_base} hold {}",
+                        src.char_base, s.2
+                    );
+                }
+                // The tilemaps follow the art a frame or two later, and for
+                // that gap the map's prediction and the drawn picture are
+                // rendered from the same swapped art, so the agreement score
+                // cannot tell garbage from ground. Sit the gap out in 2D.
+                let hold = if same_base && changed * 8 > 2048 {
+                    4
+                } else {
+                    s.2.saturating_sub(1)
+                };
+                *s = (src.char_base, words, hold);
+                hold > 0
+            });
+            if swapped {
+                return None;
+            }
+        }
         if let Some(cap) = cap.filter(|c| c.bg_frame.len() >= ppu::WIDTH * ppu::HEIGHT) {
             let score = |cx: i32, cy: i32| -> (u32, u32) {
                 let (mut hit, mut n) = (0u32, 0u32);
