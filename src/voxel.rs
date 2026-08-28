@@ -73,6 +73,13 @@ const SKIP: u32 = 0xFFFF_FFFF;
 /// off the bottom of the screen.
 const VPAD: f32 = 1.0;
 
+/// Blank rows the same sprite leaves at the TOP of its cell. Also measured:
+/// over a Viridian walk every unclipped figure sat 11 to 13 rows below the
+/// cell's top edge, twelve by a wide margin, which with VPAD leaves the
+/// nineteen-pixel character the drawn box reports. Taking the cell's own top
+/// instead drew a thirty-one pixel figure, a person stretched to twice height.
+const TPAD: f32 = 12.0;
+
 /// Metatiles per row of a FRLG tileset's metatile image. A multi-metatile
 /// object's cell one row down is this many ids on.
 const META_ROW: u16 = 8;
@@ -95,7 +102,43 @@ const WATER: f32 = -3.0;
 /// texture. Three quarters is what leaves the base of each tree showing, so a
 /// receding line reads as separate trees, and it still stands a tree half
 /// again as tall as the ground it covers.
-const TREE_TALL: f32 = 0.75;
+const TREE_TALL_DEFAULT: f32 = 0.75;
+/// How far out from the middle of the picture stays sharp, and how long the
+/// fall-off into the margin runs, both as a fraction of the width. See the
+/// margin note in `tilt_shift`. GBA_MARGIN scales how hard the margin fades;
+/// 0 turns it off and the sides come back exactly as they were.
+const MARGIN_BAND: f32 = 0.29;
+const MARGIN_RANGE: f32 = 0.20;
+const MARGIN_FADE_DEFAULT: f32 = 1.0;
+/// How many trees deep a wood is shaded before it stops getting darker, and
+/// how much darker each tree back is drawn. See the depth count in the tree
+/// pass. Overridable live with GBA_WOOD (0 turns the shading off entirely and
+/// every tree is drawn at full brightness again).
+const WOOD_DEEP: u32 = 4;
+const WOOD_DARK_DEFAULT: f32 = 0.13;
+/// Overridable with GBA_TREE_TALL while eyeballing the tree line live.
+fn tree_tall() -> f32 {
+    std::env::var("GBA_TREE_TALL")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(TREE_TALL_DEFAULT)
+}
+
+/// Overridable with GBA_MARGIN while eyeballing the sides live.
+fn margin_fade() -> f32 {
+    std::env::var("GBA_MARGIN")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(MARGIN_FADE_DEFAULT)
+}
+
+/// Overridable with GBA_WOOD while eyeballing the tree line live.
+fn wood_dark() -> f32 {
+    std::env::var("GBA_WOOD")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(WOOD_DARK_DEFAULT)
+}
 
 #[inline]
 fn rgb555(c: u16) -> u32 {
@@ -210,6 +253,28 @@ impl Art {
     #[inline]
     fn top_at(&self, slot: usize, x: usize, y: usize) -> u32 {
         self.top[slot * 256 + y * 16 + x]
+    }
+
+    /// A copy of `slot` carrying pixels the game drew rather than the ones the
+    /// metatile predicts, for a cell the game is animating under us. Only the
+    /// composite changes: everything the classifier decided about this cell
+    /// (is it a plant, is it thin, how far down does its object reach) stays
+    /// exactly as it was, so an animating door is still part of the wall it
+    /// sits in and nothing moves. Not cached by metatile id, because the same
+    /// id is a shut door everywhere else on the map.
+    fn drawn_copy(&mut self, slot: usize, comp: &[u32; 256]) -> usize {
+        let new = self.cover.len();
+        self.comp.extend_from_slice(comp);
+        let (b, e) = (slot * 256, slot * 256 + 256);
+        let (top, bot) = (self.top[b..e].to_vec(), self.bot[b..e].to_vec());
+        self.top.extend_from_slice(&top);
+        self.bot.extend_from_slice(&bot);
+        self.cover.push(self.cover[slot]);
+        self.ymax.push(self.ymax[slot]);
+        self.leaf.push(self.leaf[slot]);
+        self.flat.push(self.flat[slot]);
+        self.dark.push(self.dark[slot]);
+        new
     }
 }
 
@@ -467,7 +532,11 @@ pub fn trace() -> bool {
 /// the most: the camera tilt makes distant rows climb the screen.
 const MX: i32 = 8;
 const MY_N: i32 = 10;
-const MY_S: i32 = 3;
+// Three rows was not enough to reach the bottom of the diorama frame: the
+// nearest rows project large, so the last twenty-odd pixels of the picture had
+// no map under them and showed the background. It moved with the camera, which
+// is the black strip that twitched along the bottom edge while walking.
+const MY_S: i32 = 5;
 
 impl MapGrid {
     /// Columns and rows in the window (the visible frame is 16 x 11 of them).
@@ -590,16 +659,31 @@ impl MapGrid {
                 }
             }
         }
+        // MapHeader +0x17 is the map type. FireRed's own IsMapTypeIndoors
+        // counts 8 (indoor) and 9 (secret base) as inside; towns, cities,
+        // routes and caves are everything else. Measured: Pallet Town and
+        // Viridian City read 1, Oak's lab and the Viridian Pokemon Center
+        // read 8.
+        let indoors = matches!(rd8(0x0203_6DFC + 0x17), Some(8 | 9));
         if dbg {
-            eprintln!("grid: map {mapw}x{maph} conn={conn:02X}");
+            eprintln!("grid: map {mapw}x{maph} conn={conn:02X} indoors={indoors}");
         }
-        // FRLG border block: 4x4 metatiles tiled past every unconnected edge.
-        let border = rd32(layout + 8)
+        // FRLG border block: 4x4 metatiles the game tiles past every
+        // unconnected edge. Outdoors that is real scenery, the tree line that
+        // keeps Pallet Town from ending in a void, and it belongs in the
+        // diorama. Indoors it is whatever the layout happened to leave there,
+        // because the game clamps its camera inside the room and never shows
+        // it: the Viridian Pokemon Center's is a slice of the front counter,
+        // which tiled out into a wall of counters on all four sides of the
+        // room. Outside a room there is nothing to draw.
+        let border = (!indoors)
+            .then(|| rd32(layout + 8))
+            .flatten()
             .filter(|&p| p >> 24 == 8 || p >> 24 == 9)
             .map(|border_ptr| {
                 let mut b = [0u16; 16];
-                for i in 0..16 {
-                    b[i] = rd16(border_ptr + i as u32 * 2).unwrap_or(0x3FF);
+                for (i, e) in b.iter_mut().enumerate() {
+                    *e = rd16(border_ptr + i as u32 * 2).unwrap_or(0x3FF);
                 }
                 b
             });
@@ -1123,6 +1207,59 @@ impl MapGrid {
                 slots.push(slot);
             }
         }
+        // AN ANIMATING TILE: WHAT THE GAME DREW BEATS WHAT THE MAP SAYS.
+        //
+        // A door is not in the map data at all. FireRed animates one by
+        // redrawing the doorway straight into the picture, so the map grid
+        // goes on saying "shut door" for the whole animation and the diorama
+        // drew a shut door while the player walked through an open one. That
+        // is the missing door animation, and the same is true of any tile the
+        // game repaints under us.
+        //
+        // The picture is right there: the camera was just verified against it.
+        // So every cell the GBA is really drawing is compared with the art the
+        // map predicts, and where the two genuinely disagree the drawn pixels
+        // win. A quarter of the tile has to change before that happens, which
+        // no amount of palette drift or sub-pixel scroll reaches, and cells
+        // outside the 240x160 frame have no drawn pixels to prefer and keep
+        // the map art, which is the only thing they ever had.
+        if let Some(cap) = cap.filter(|c| c.bg_frame.len() >= ppu::WIDTH * ppu::HEIGHT) {
+            for cy in 0..Self::ROWS as i32 {
+                for cx in 0..Self::COLS as i32 {
+                    let i = cy as usize * Self::COLS + cx as usize;
+                    if cells[i] == Cell::Void {
+                        continue;
+                    }
+                    let sx0 = (gx0 + cx) * 16 - camx + 112;
+                    let sy0 = (gy0 + cy) * 16 - camy + 80;
+                    if sx0 < 0
+                        || sy0 < 0
+                        || sx0 + 16 > ppu::WIDTH as i32
+                        || sy0 + 16 > ppu::HEIGHT as i32
+                    {
+                        continue;
+                    }
+                    let slot = slots[i] as usize;
+                    let mut drawn = [0u32; 256];
+                    let mut differ = 0u32;
+                    {
+                        let a = art.borrow();
+                        for y in 0..16usize {
+                            let row = (sy0 as usize + y) * ppu::WIDTH + sx0 as usize;
+                            for x in 0..16usize {
+                                let c = cap.bg_frame[row + x];
+                                drawn[y * 16 + x] = c;
+                                differ += (c != a.comp_at(slot, x, y)) as u32;
+                            }
+                        }
+                    }
+                    if differ * 4 >= 256 {
+                        slots[i] = art.borrow_mut().drawn_copy(slot, &drawn) as u32;
+                    }
+                }
+            }
+        }
+
         // Whatever the player is standing on is never a lone volume: FireRed
         // lets him stand on a warp mat or a stair tile, and extruding that one
         // cell wrapped him in a box.
@@ -1255,7 +1392,17 @@ impl MapGrid {
         // in front of it, which is what makes a one-cell walkable gap beside a
         // building read as a sliver. GBA_3D_WALL=1 halves that.
         let wall = (len - 1).min(wall_steps()) as u8;
-        Cell::Block { h: STEP * wall as f32, n: len as u8, k: j as u8, wall }
+        // FURNITURE IS NOT AS TALL AS A PERSON.
+        //
+        // Every built run stood a whole step high, and a step is sixteen
+        // units against a character's twenty, so a bathroom table in a Pokemon
+        // Center rose almost to the top of the man standing behind it and its
+        // lifted top swallowed him. A run only two cells deep is a table, a
+        // counter, a bank of shelves; walls and buildings run longer. Half a
+        // step reads as raised furniture and leaves a person behind it visible
+        // from the waist up, which is what the game shows.
+        let h = if len == 2 { STEP * 0.5 } else { STEP * wall as f32 };
+        Cell::Block { h, n: len as u8, k: j as u8, wall }
     }
 
     /// The camera's position in map pixels. FireRed locks the camera to the
@@ -1680,6 +1827,13 @@ impl Renderer {
             if id == NO_TREE {
                 continue;
             }
+            // Trees out in the margin are faded on purpose, so they are not
+            // evidence of anything and are left out of the count. The claim
+            // this check defends is about the picture the game itself shows.
+            let d = ((i % WIDTH) as f32 / WIDTH as f32 - 0.5).abs() - MARGIN_BAND;
+            if (d / MARGIN_RANGE).clamp(0.0, 1.0) * margin_fade() > 0.0 {
+                continue;
+            }
             painted[id as usize] += 1;
             off[id as usize] += (self.buffer[i] != self.tree_paint[i]) as u32;
         }
@@ -1725,16 +1879,32 @@ impl Renderer {
                     // The floor under every cell of the unit is the grass next
                     // door in shadow. Painting the tree's own metatile flat is
                     // what put a pale green shelf under each canopy.
+                    // THE FLOOR UNDER A TREE.
+                    //
+                    // A tree metatile draws its canopy in the top layer over a
+                    // ground layer that is the very patch of shadowed grass the
+                    // tree stands in. That ground layer is the right floor, and
+                    // laying it down is not the old "canopy as a pale shelf"
+                    // bug, which came from painting the COMPOSITE flat.
+                    //
+                    // Borrowing a neighbour's floor instead is what made tree
+                    // lines look hacked apart: floor_near takes the closest
+                    // walkable cell in any direction, so a tree column running
+                    // beside a sand path stood on SAND, and every gap the
+                    // billboards left between them showed a bright tan wedge
+                    // where the game draws shade. A tree only borrows now when
+                    // its whole picture lives in the ground layer and it has no
+                    // ground of its own to fall back on.
                     let (gs, dark) = g.floor_near(cx, cy);
+                    let own = g.art.cover[slot] > 0.05;
                     self.quad_uv(ground, &mut |u, v| {
-                        shade(
-                            g.art.comp_at(
-                                gs,
-                                (u * 16.0).clamp(0.0, 15.0) as usize,
-                                (v * 16.0).clamp(0.0, 15.0) as usize,
-                            ),
-                            dark,
-                        )
+                        let px = (u * 16.0).clamp(0.0, 15.0) as usize;
+                        let py = (v * 16.0).clamp(0.0, 15.0) as usize;
+                        if own {
+                            shade(g.art.bot_at(slot, px, py), dark)
+                        } else {
+                            shade(g.art.comp_at(gs, px, py), dark)
+                        }
                     });
                     if dx != 0 || dy != 0 {
                         continue; // the unit's north-west cell carries the tree
@@ -1743,7 +1913,26 @@ impl Renderer {
                     let xe = g.ox + (cx + w) as f32 * STEP;
                     let zbase = g.oz - (cy + h) as f32 * STEP; // unit's south edge
                     let (aw, ah) = ((w * 16) as f32, (h * 16) as f32);
-                    let hgt = ah * TREE_TALL;
+                    // HOW FAR INTO THE WOOD THIS TREE IS.
+                    //
+                    // Every tree in a block is the same picture as the one in
+                    // front of it, drawn at the same brightness a few pixels
+                    // higher up, and that is what makes a block of them read
+                    // as one image stamped over and over rather than as a
+                    // wood. A real wood goes dark as it goes back. Counting
+                    // the trees between this one and the open ground in front
+                    // gives a depth, and shading by it lets the eye read the
+                    // repetition as distance, which is what it is.
+                    let mut depth = 0u32;
+                    let mut ny = cy + h;
+                    while depth < WOOD_DEEP
+                        && let Cell::Tree { h: nh, .. } = g.at(cx, ny)
+                    {
+                        depth += 1;
+                        ny += nh as i32;
+                    }
+                    let gloom = 1.0 - wood_dark() * depth as f32;
+                    let hgt = ah * tree_tall();
                     let (uy, uz) = (COS_P, SIN_P);
                     let q = [
                         project(x0, hgt * uy, zbase + hgt * uz),
@@ -1768,7 +1957,7 @@ impl Renderer {
                         if g.art.top_at(src, ax, ay) == SKIP && c == g.art.comp_at(gs, ax, ay) {
                             SKIP
                         } else {
-                            c
+                            shade(c, gloom)
                         }
                     });
                     self.marking = NO_TREE;
@@ -2082,11 +2271,23 @@ impl Renderer {
                 if max_x >= W as f32 {
                     max_x = b[2] as f32 - padl;
                 }
-                if feet >= ppu::HEIGHT as f32 {
+                // A SLIVER IS NOT A MEASUREMENT.
+                //
+                // Clipping at the left or right edge does not just shorten a
+                // figure's width, it destroys its HEIGHT too: all that is left
+                // inside the frame may be a two-pixel-wide strip of him, and
+                // the tallest drawn pixel in a strip that misses his hat is
+                // most of a head lower than the top of the character. He was
+                // then drawn as a quad that short, which is a person squashed
+                // flat on the ground. So a figure clipped on either side takes
+                // its whole vertical extent from OAM as well, exactly as one
+                // clipped at the top or the bottom already did.
+                let sliver = min_x <= 0.0 || max_x >= W as f32;
+                if feet >= ppu::HEIGHT as f32 || sliver {
                     feet = b[3] as f32 - VPAD;
                 }
-                if top <= 0.0 {
-                    top = b[1] as f32;
+                if top <= 0.0 || sliver {
+                    top = b[1] as f32 + TPAD;
                 }
             }
             let (ccx, cw) = ((min_x + max_x) / 2.0, (max_x - min_x) / 2.0);
@@ -2304,38 +2505,80 @@ impl Renderer {
             // both agree he is past it, and since it only ever repaints pixels
             // that something really is covering, holding it a frame longer than
             // needed changes nothing on screen.
-            let probe = |cx: i32, cy: i32| {
-                (1..=3).any(|d| {
-                    [-12, 0, 12].iter().any(|&sx| {
-                        matches!(
-                            mgrid.cell_at_map(cx + sx, cy + d * 16),
-                            Cell::Block { h, .. } if h > 0.0
-                        )
-                    })
-                })
+            // The probe answers with HOW TALL the thing in front of him is,
+            // because that is what decides how much of him it can really hide.
+            let probe = |cx: i32, cy: i32| -> Option<f32> {
+                let mut tall: Option<f32> = None;
+                for d in 1..=3 {
+                    for sx in [-12, 0, 12] {
+                        if let Cell::Block { h, .. } = mgrid.cell_at_map(cx + sx, cy + d * 16)
+                            && h > 0.0
+                        {
+                            tall = Some(tall.map_or(h, |t: f32| t.max(h)));
+                        }
+                    }
+                }
+                tall
             };
-            let behind_volume = player
-                && (probe(ax, ay - 8)
-                    || probe(mgrid.player.0 * 16 + 8, mgrid.player.1 * 16 + 8));
+            // EVERY character gets the cutout, not just the player. The
+            // second probe is the player's own game cell, so it only means
+            // anything for him, but the volume test itself has to run for
+            // NPCs too: the man sitting by the mirror in a Pokemon Center
+            // stands one row behind a table, the table is a volume 16 tall,
+            // and lifting it carried it over him. All that was left of him
+            // was the top of his head, which is the "he disappears into the
+            // furniture" report. FireRed itself never lets scenery cover a
+            // character, so drawing him over the volume is also the more
+            // faithful answer.
+            //
+            // The FAINT silhouette stays the player's alone. It fires on
+            // ordinary half-cover, and every NPC standing in tall grass or
+            // behind a sign would start ghosting through it.
+            let front = probe(ax, ay - 8).or_else(|| {
+                player.then(|| probe(mgrid.player.0 * 16 + 8, mgrid.player.1 * 16 + 8)).flatten()
+            });
+            let behind_volume = front.is_some();
             let center_dist =
                 (ccx - ppu::WIDTH as f32 / 2.0).abs() + (feet - ppu::HEIGHT as f32 / 2.0).abs();
             let hidden = self.cov - self.vis;
-            let ghost = center_dist < 40.0
-                && if behind_volume { hidden > 0 } else { hidden * 2 > self.cov };
+            let ghost = if behind_volume {
+                hidden > 0
+            } else {
+                player && center_dist < 40.0 && hidden * 2 > self.cov
+            };
             if ghost {
                 // Behind a building he is drawn whole and in full colour over
                 // the roof; behind anything smaller a faint silhouette is
                 // enough and keeps him from reading as standing in front of a
                 // fence he is really behind.
+                // HOW MUCH OF HIM COMES BACK.
+                //
+                // The player comes back whole: he is the one the camera is
+                // for, and a character who half-vanishes behind his own house
+                // is the sinking this cutout exists to stop.
+                //
+                // Anyone else comes back only as far down as the thing in
+                // front of him reaches. A table sixteen units high standing
+                // before a man thirty-two units tall covers his legs and
+                // nothing more, so his legs stay covered and he reads as
+                // standing BEHIND the table. Repainting all of him instead put
+                // him on top of it, standing on the furniture. The same sum
+                // leaves a character behind a real wall hidden, because a wall
+                // as tall as he is cuts away everything there was to bring
+                // back, which is what should happen.
+                let cut = match front {
+                    Some(h) if !player => 1.0 - (h / hart.max(1.0)).clamp(0.0, 1.0),
+                    _ => 1.0,
+                };
                 self.quad_uv_ghost(
                     q,
-                    &mut sampler,
+                    &mut |u, v| if v < cut { sampler(u, v) } else { SKIP },
                     if behind_volume { Ghost::Solid } else { Ghost::Faint },
                 );
             }
             if trace() {
                 println!(
-                    "HIDE {fig} player {p} behind {b} cov {c} vis {v} ghost {g}",
+                    "HIDE {fig} player {p} behind {b} cov {c} vis {v} ghost {g} hart {hart} front {front:?}",
                     p = player as u8,
                     b = behind_volume as u8,
                     c = self.cov,
@@ -2398,15 +2641,36 @@ impl Renderer {
         let (spacing, band, range, sat) = presets[(level as usize - 1).min(2)];
         let spacing = (HEIGHT as f32 * spacing).clamp(0.75, 3.0);
         const WTS: [i32; 5] = [930, 797, 498, 221, 66]; // gaussian * 4096
-        let strength = |y: usize| {
+        // THE MARGIN THE GAME NEVER SHOWS.
+        //
+        // The diorama camera is wider than the Game Boy's 240x160 frame, so
+        // the sides of the picture are map the real game never draws. That is
+        // where FireRed keeps the deep blocks of border trees, and a block of
+        // trees is the one thing this renderer cannot draw honestly: the tree
+        // tile is painted from directly overhead and simply has no side, so
+        // standing it up invents a face that does not exist in the artwork.
+        // Every attempt to make that block look right traded one artifact for
+        // another, because there was no right answer to find.
+        //
+        // So the margin stops being scenery to examine and becomes depth. It
+        // falls away to the sides the same way the picture already falls away
+        // top and bottom, which is what a real photograph of a model does, and
+        // the eye lands on the part of the map the game itself is showing.
+        let margin = |x: usize| {
+            let d = (x as f32 / WIDTH as f32 - 0.5).abs() - MARGIN_BAND;
+            (d / MARGIN_RANGE).clamp(0.0, 1.0)
+        };
+        let strength = |x: usize, y: usize| {
             let d = (y as f32 / HEIGHT as f32 - 0.5).abs() - band;
-            let s = (d / range).clamp(0.0, 1.0);
+            let s = (d / range).clamp(0.0, 1.0).max(margin(x));
             s * s * spacing
         };
         let keep = std::mem::take(&mut self.tree_id);
         let blur = |src: &[u32], dst: &mut [u32], horizontal: bool| {
             for y in 0..HEIGHT {
-                let o = strength(y);
+                // The blur is strongest at the far left and right of a row, so
+                // that is what decides whether the row can be skipped at all.
+                let o = strength(0, y);
                 let row = y * WIDTH;
                 // The widest tap is (4 * o) as i32, so below 0.25 every tap
                 // reads the same source pixel and the blur is a no-op. Skip
@@ -2419,8 +2683,16 @@ impl Renderer {
                 for x in 0..WIDTH {
                     // A tree's own pixels are the game's artwork and are
                     // carried through untouched; blurring them is what let
-                    // neighbouring canopies show through one another.
-                    if keep[row + x] != NO_TREE {
+                    // neighbouring canopies show through one another. Out in
+                    // the margin that protection is dropped: those trees are
+                    // not the game's picture, they are past the edge of it.
+                    let m = margin(x);
+                    if keep[row + x] != NO_TREE && m == 0.0 {
+                        dst[row + x] = src[row + x];
+                        continue;
+                    }
+                    let o = strength(x, y);
+                    if o * 4.0 < 1.0 {
                         dst[row + x] = src[row + x];
                         continue;
                     }
@@ -2457,13 +2729,20 @@ impl Renderer {
         // OFF the game's palette, so the trees are left out of it: they are
         // the biggest flat areas on screen and the only ones the eye compares
         // against its memory of the real game.
-        for (c, &id) in self.buffer.iter_mut().zip(keep.iter()) {
-            if id != NO_TREE {
+        for (i, (c, &id)) in self.buffer.iter_mut().zip(keep.iter()).enumerate() {
+            let m = margin(i % WIDTH) * margin_fade();
+            // A tree inside the picture is still left completely alone.
+            if id != NO_TREE && m == 0.0 {
                 continue;
             }
             let (r, g, b) = ((*c >> 16 & 0xFF) as f32, (*c >> 8 & 0xFF) as f32, (*c & 0xFF) as f32);
             let luma = 0.299 * r + 0.587 * g + 0.114 * b;
-            let mix = |ch: f32| (luma + (ch - luma) * sat).clamp(0.0, 255.0) as u32;
+            // Out in the margin the lift runs the other way: colour drains out
+            // and the light goes with it, so the sides read as distance rather
+            // than as more picture to study.
+            let s = if id == NO_TREE { sat } else { 1.0 } * (1.0 - m);
+            let dim = 1.0 - m * 0.55;
+            let mix = |ch: f32| ((luma + (ch - luma) * s) * dim).clamp(0.0, 255.0) as u32;
             *c = mix(r) << 16 | mix(g) << 8 | mix(b);
         }
         self.tree_id = keep;
