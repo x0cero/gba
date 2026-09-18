@@ -170,3 +170,251 @@ dd {
 code {
   color: var(--fg);
 }
+
+/* Touch play. The .touch-on class is set from app.js on coarse-pointer
+   devices; everything below is inert on desktop. */
+
+.touch-on header,
+.touch-on .keys dl {
+  display: none;
+}
+
+.touch-on {
+  padding: 0;
+  display: block;
+}
+
+.touch-on main {
+  max-width: none;
+}
+
+.touch-on {
+  overflow: hidden;
+  height: 100dvh;
+}
+
+.touch-on main {
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}
+
+.touch-on .player {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding-top: env(safe-area-inset-top);
+}
+
+.touch-on .keys {
+  display: none;
+}
+
+.touch-on .screen-wrap {
+  width: 100%;
+  border-left: none;
+  border-right: none;
+}
+
+.touch-on .bar {
+  margin: 0;
+  padding: 10px max(16px, env(safe-area-inset-right))
+    max(12px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+  border-top: 1px solid var(--line);
+}
+
+.touch {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 10px max(16px, env(safe-area-inset-left)) max(18px, env(safe-area-inset-bottom))
+    max(16px, env(safe-area-inset-right));
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.touch[hidden] {
+  display: none;
+}
+
+.shoulders {
+  display: flex;
+  justify-content: space-between;
+}
+
+.clusters {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex: 1;
+  padding: 8px 4px;
+}
+
+.meta-row {
+  display: flex;
+  justify-content: center;
+  gap: 18px;
+}
+
+.tbtn {
+  touch-action: none;
+  -webkit-tap-highlight-color: transparent;
+  color: var(--dim);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.tbtn.pressed {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: #1a1d24;
+}
+
+.tbtn.shoulder {
+  width: 84px;
+  padding: 10px 0;
+  font-size: 13px;
+  border-radius: 6px;
+}
+
+.tbtn.round {
+  width: 62px;
+  height: 62px;
+  border-radius: 50%;
+  font-size: 15px;
+  padding: 0;
+}
+
+.face {
+  display: grid;
+  grid-template-columns: 58px 58px;
+  grid-template-rows: 44px 44px;
+}
+
+.face .a {
+  grid-column: 2;
+  grid-row: 1;
+}
+
+.face .b {
+  grid-column: 1;
+  grid-row: 2;
+}
+
+.tbtn.pill {
+  padding: 8px 22px;
+  font-size: 11px;
+  border-radius: 999px;
+}
+
+.dpad {
+  position: relative;
+  width: 148px;
+  height: 148px;
+  touch-action: none;
+}
+
+.dpad .arm,
+.dpad .hub {
+  position: absolute;
+  background: var(--panel);
+  border: 1px solid var(--line);
+}
+
+.dpad .up,
+.dpad .down {
+  left: 50px;
+  width: 48px;
+  height: 52px;
+}
+
+.dpad .up {
+  top: 0;
+  border-bottom: none;
+  border-radius: 8px 8px 0 0;
+}
+
+.dpad .down {
+  bottom: 0;
+  border-top: none;
+  border-radius: 0 0 8px 8px;
+}
+
+.dpad .left,
+.dpad .right {
+  top: 50px;
+  width: 52px;
+  height: 48px;
+}
+
+.dpad .left {
+  left: 0;
+  border-right: none;
+  border-radius: 8px 0 0 8px;
+}
+
+.dpad .right {
+  right: 0;
+  border-left: none;
+  border-radius: 0 8px 8px 0;
+}
+
+.dpad .hub {
+  left: 50px;
+  top: 50px;
+  width: 48px;
+  height: 48px;
+  border: none;
+}
+
+.dpad .arm.pressed {
+  background: #1a1d24;
+  border-color: var(--accent);
+}
+
+/* Landscape: the screen takes the full height and the controls float over
+   its sides, the way every handheld shell app does it. */
+@media (orientation: landscape) {
+  .touch-on .player {
+    position: relative;
+    padding-top: 0;
+  }
+
+  .touch-on .screen-wrap {
+    height: 100%;
+    width: auto;
+    aspect-ratio: 240 / 160;
+    margin: 0 auto;
+    border: none;
+  }
+
+  .touch {
+    position: absolute;
+    inset: 0;
+    padding: 12px max(14px, env(safe-area-inset-right)) max(14px, env(safe-area-inset-bottom))
+      max(14px, env(safe-area-inset-left));
+  }
+
+  .touch .tbtn,
+  .touch .dpad .arm,
+  .touch .dpad .hub {
+    opacity: 0.62;
+  }
+
+  .clusters {
+    align-items: flex-end;
+    padding: 0;
+  }
+
+  .meta-row {
+    position: absolute;
+    bottom: max(14px, env(safe-area-inset-bottom));
+    left: 50%;
+    transform: translateX(-50%);
+  }
+}

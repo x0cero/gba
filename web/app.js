@@ -39,6 +39,7 @@ const KEYS = {
   KeyQ: 9,
 };
 let pressed = 0;
+let touchPressed = 0;
 
 function key(e, down) {
   if (!(e.code in KEYS)) return;
@@ -46,6 +47,96 @@ function key(e, down) {
   pressed = down ? pressed | bit : pressed & ~bit;
   e.preventDefault();
 }
+
+// On-screen controls for coarse-pointer devices. Buttons hold their KEYINPUT
+// bit in data-bit; the d-pad is one surface that resolves each active pointer
+// to up to two direction bits so diagonals work, and a thumb can slide from
+// one direction to another without lifting.
+const touchEl = document.getElementById("touch");
+const isTouch = window.matchMedia("(pointer: coarse)").matches;
+
+function setupTouch() {
+  document.body.classList.add("touch-on");
+  touchEl.hidden = false;
+  for (const el of document.querySelectorAll(".touch-note")) el.hidden = false;
+
+  for (const btn of touchEl.querySelectorAll(".tbtn")) {
+    const bit = 1 << Number(btn.dataset.bit);
+    const down = (e) => {
+      touchPressed |= bit;
+      btn.classList.add("pressed");
+      if (e.cancelable) e.preventDefault();
+    };
+    const up = () => {
+      touchPressed &= ~bit;
+      btn.classList.remove("pressed");
+    };
+    btn.addEventListener("pointerdown", down);
+    btn.addEventListener("pointerup", up);
+    btn.addEventListener("pointercancel", up);
+    btn.addEventListener("pointerleave", up);
+    btn.addEventListener("contextmenu", (e) => e.preventDefault());
+  }
+
+  const dpad = document.getElementById("dpad");
+  const DPAD_MASK = 0b11110000; // Right, Left, Up, Down
+  const arms = {
+    16: dpad.querySelector(".right"),
+    32: dpad.querySelector(".left"),
+    64: dpad.querySelector(".up"),
+    128: dpad.querySelector(".down"),
+  };
+  const pointers = new Map();
+
+  function dpadBits(e) {
+    const r = dpad.getBoundingClientRect();
+    const dx = (e.clientX - r.left) / r.width - 0.5;
+    const dy = (e.clientY - r.top) / r.height - 0.5;
+    if (Math.hypot(dx, dy) < 0.12) return 0;
+    let bits = 0;
+    // 0.20 rather than 0.5/sqrt(2): a generous diagonal zone beats a precise
+    // one on glass, where thumbs drift toward the cardinal they started on.
+    if (dx > 0.2) bits |= 16;
+    else if (dx < -0.2) bits |= 32;
+    if (dy < -0.2) bits |= 64;
+    else if (dy > 0.2) bits |= 128;
+    return bits;
+  }
+
+  function applyDpad() {
+    let bits = 0;
+    for (const b of pointers.values()) bits |= b;
+    touchPressed = (touchPressed & ~DPAD_MASK) | bits;
+    for (const [bit, el] of Object.entries(arms)) {
+      el.classList.toggle("pressed", (bits & bit) !== 0);
+    }
+  }
+
+  dpad.addEventListener("pointerdown", (e) => {
+    try {
+      dpad.setPointerCapture(e.pointerId);
+    } catch {
+      // A pointer that vanished between the event and here is already gone.
+    }
+    pointers.set(e.pointerId, dpadBits(e));
+    applyDpad();
+    e.preventDefault();
+  });
+  dpad.addEventListener("pointermove", (e) => {
+    if (!pointers.has(e.pointerId)) return;
+    pointers.set(e.pointerId, dpadBits(e));
+    applyDpad();
+  });
+  for (const type of ["pointerup", "pointercancel"]) {
+    dpad.addEventListener(type, (e) => {
+      pointers.delete(e.pointerId);
+      applyDpad();
+    });
+  }
+  dpad.addEventListener("contextmenu", (e) => e.preventDefault());
+}
+
+if (isTouch) setupTouch();
 
 window.addEventListener("keydown", (e) => key(e, true));
 window.addEventListener("keyup", (e) => key(e, false));
@@ -188,7 +279,7 @@ function frame(now) {
   // emulate every missed frame at once and never catch up.
   owed = Math.min(owed + elapsed / FRAME_MS, 4);
 
-  emu.set_keys(pressed);
+  emu.set_keys(pressed | touchPressed);
   while (owed >= 1) {
     owed -= 1;
     emu.step_frame();
@@ -230,6 +321,11 @@ async function fetchTestRom() {
 }
 
 async function main() {
+  // The service worker exists for the installed home-screen copy: it caches
+  // the shell so the app opens offline. file:// and localhost dev skip it.
+  if ("serviceWorker" in navigator && location.protocol === "https:") {
+    navigator.serviceWorker.register("sw.js").catch(() => {});
+  }
   await init();
   status("no ROM loaded");
   requestAnimationFrame(frame);

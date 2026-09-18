@@ -2,7 +2,18 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#0c0d0f" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="gba" />
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="icon-192.png" />
+    <link rel="icon" type="image/png" href="icon-192.png" />
     <title>gba - Rust Game Boy Advance emulator</title>
     <link rel="stylesheet" href="style.css" />
   </head>
@@ -17,11 +28,37 @@
         </p>
       </header>
 
-      <div class="screen-wrap">
-        <canvas id="screen" width="240" height="160"></canvas>
-        <div id="overlay" class="overlay">
-          <button id="start" type="button">Start</button>
-          <p>Audio needs a click before it can play.</p>
+      <div class="player">
+        <div class="screen-wrap">
+          <canvas id="screen" width="240" height="160"></canvas>
+          <div id="overlay" class="overlay">
+            <button id="start" type="button">Start</button>
+            <p>Audio needs a tap before it can play.</p>
+          </div>
+        </div>
+
+        <div id="touch" class="touch" hidden>
+          <div class="shoulders">
+            <button class="tbtn shoulder" data-bit="9" type="button">L</button>
+            <button class="tbtn shoulder" data-bit="8" type="button">R</button>
+          </div>
+          <div class="clusters">
+            <div id="dpad" class="dpad" aria-label="D-pad">
+              <span class="arm up"></span>
+              <span class="arm down"></span>
+              <span class="arm left"></span>
+              <span class="arm right"></span>
+              <span class="hub"></span>
+            </div>
+            <div class="face">
+              <button class="tbtn round a" data-bit="0" type="button">A</button>
+              <button class="tbtn round b" data-bit="1" type="button">B</button>
+            </div>
+          </div>
+          <div class="meta-row">
+            <button class="tbtn pill" data-bit="2" type="button">select</button>
+            <button class="tbtn pill" data-bit="3" type="button">start</button>
+          </div>
         </div>
       </div>
 
@@ -44,6 +81,12 @@
           <div><dt>Arrows</dt><dd>D-pad</dd></div>
           <div><dt>Q / W</dt><dd>L / R</dd></div>
         </dl>
+        <p class="note touch-note" hidden>
+          On a phone this page plays with the on-screen controls, and you can
+          add it to your home screen to run it full screen like an app. Saves
+          live in your browser, so they survive both a reload and going
+          offline.
+        </p>
         <p class="note">
           No ROM is bundled with this page, and none ever will be. Pick a
           <code>.gba</code> file with the button above: it is read in the
@@ -59,7 +102,7 @@
         </p>
         <p class="note">
           Source:
-          <a href="https://github.com/0arch-io/gba">github.com/0arch-io/gba</a>
+          <a href="https://github.com/x0cero/gba">github.com/x0cero/gba</a>
         </p>
       </section>
     </main>

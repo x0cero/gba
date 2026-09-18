@@ -1,10 +1,10 @@
 # gba
 
-[![CI](https://github.com/0arch-io/gba/actions/workflows/ci.yml/badge.svg)](https://github.com/0arch-io/gba/actions/workflows/ci.yml)
+[![CI](https://github.com/x0cero/gba/actions/workflows/ci.yml/badge.svg)](https://github.com/x0cero/gba/actions/workflows/ci.yml)
 
 Game Boy Advance emulator written from scratch in Rust. Runs Pokémon FireRed, frame-identical to mGBA.
 
-**[Play it in your browser](https://0arch-io.github.io/gba/)**: the same Rust core compiled to WebAssembly. Drop in your own `.gba` file, or click "Run CPU test suite" to see the emulator work without one.
+**[Play it in your browser](https://x0cero.github.io/gba/)**: the same Rust core compiled to WebAssembly. Drop in your own `.gba` file, or click "Run CPU test suite" to see the emulator work without one.
 
 No emulation libraries and no ported reference code: the ARM7TDMI core, the PPU, the DMA controller, the timers, the save hardware and the audio path were each built against the hardware documentation and test ROMs, one failing case at a time. No BIOS image is required; the BIOS calls games actually make are implemented in high-level Rust.
 
@@ -51,7 +51,7 @@ No ROMs are included in this repository, and none ever will be. The test ROMs us
 
 ### Download
 
-Prebuilt binaries for macOS (Apple Silicon), Linux (x86_64), and Windows (x86_64) are attached to each tagged release on the [releases page](https://github.com/0arch-io/gba/releases). Download the archive for your platform, unpack it, and run the binary with a ROM path.
+Prebuilt binaries for macOS (Apple Silicon), Linux (x86_64), and Windows (x86_64) are attached to each tagged release on the [releases page](https://github.com/x0cero/gba/releases). Download the archive for your platform, unpack it, and run the binary with a ROM path.
 
 Battery saves are written to `<rom>.gba.sav` next to the ROM, sized to whatever save chip the cartridge actually declares. Save states go to `<rom>.gba.state`.
 
