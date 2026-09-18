@@ -38,6 +38,7 @@ On the standard suites, the CPU core passes the jsmolka `arm`, `thumb` and `memo
 - **Audio**: both DirectSound FIFO channels plus all four PSG channels, mixed with output headroom and a low-pass filter, paced off the audio clock so the picture does not drift against the sound.
 - **Every common save medium, auto-detected**: 32 KB SRAM, 64 KB flash (Panasonic), 128 KB two-bank flash (Sanyo), and bit-serial EEPROM over DMA3 in both the 512 byte and 8 KB variants. The medium is inferred from the SDK marker string left in the ROM, and the emulator prints which one it chose at startup.
 - **Quality of life**: save states, pause, and hold-to-fast-forward.
+- **3D diorama mode** (`--3d`): renders the overworld of Pokémon FireRed as a tilted miniature built from the game's live map data, with no per-game hand profiling. See below.
 - **iOS frontend**: a SwiftUI app in `ios/` that drives the same Rust core through a C FFI layer, with touch controls, a game library, and MFi controller support.
 
 ## Building and running
@@ -68,12 +69,27 @@ Battery saves are written to `<rom>.gba.sav` next to the ROM, sized to whatever 
 | Fast-forward (hold) | Tab |
 | Quit | Esc |
 
+## 3D diorama mode
+
+```sh
+./target/release/gba path/to/firered.gba --3d
+```
+
+![Pokémon FireRed, Pallet Town rendered as a 3D diorama](screenshots/firered-3d-pallet-town.png)
+
+The 2D game is still running exactly as before; `--3d` only changes how the picture is drawn. Every frame, the renderer reads the game's own map grid out of RAM (the walkability and metatile layers FireRed uses for collision), reads the metatile artwork out of the ROM, and rebuilds the visible area as a small scene: walkable cells and tall grass lie flat, water sinks, buildings and fences rise to a half-height wall, and trees stand as their whole art unit. Characters are drawn as billboards pinned to their feet and leaning back to the camera pitch, with contact shadows, and the player is cut out over any roof that would hide him. The camera is integrated from the scroll registers and then checked against the drawn picture every frame; if the two disagree (battles, menus, the title screen, warp fades) the frame is shown in plain 2D and the diorama comes back when the overworld does. Dialogue and menus are composited flat on top, and a tilt-shift pass finishes the miniature look.
+
+Nothing about this is hand-authored per map. The geometry comes from the same data the game uses to decide where you can walk, so it holds across the whole overworld and inside buildings. It is tuned for FireRed and LeafGreen; the map and art decoding assume their layout, and other games fall back to 2D.
+
+`tools/regress3d.py` drives scripted playthroughs around Pallet Town and inside Oak's lab and checks camera smoothness, figure placement, warps, tree pixel-accuracy and determinism by numbers rather than by eye. Tuning knobs, all environment variables read at launch: `GBA_3D_WALL` (wall height in steps, 1 to 3, default 1), `GBA_3D_PERSP` (lens, default 3, 1 is the wide lens), `GBA_TILT` (tilt-shift strength 0 to 3, default 2), `GBA_TREE_TALL`, `GBA_MARGIN` (edge fall-off, 0 turns it off). The 3D mode is native only; the browser demo and the iOS app stay 2D.
+
 ## Architecture
 
 - `src/cpu.rs`: the ARM7TDMI core. Fetch, decode, execute, the pipeline, mode switching, and interrupt entry.
 - `src/bus.rs`: the memory map and everything hanging off it. DMA, timers, the interrupt controller, the keypad, save-chip emulation, the BIOS high-level calls, and the DirectSound mixer.
 - `src/ppu.rs`: the scanline renderer and the LCD state machine.
 - `src/psg.rs`: the four legacy Game Boy sound channels.
+- `src/voxel.rs`: the `--3d` diorama renderer, and the per-frame layer capture in `src/ppu.rs` that feeds it.
 - `src/lib.rs`: the C FFI surface that the iOS app links against.
 - `src/wasm.rs`: the wasm-bindgen surface behind the browser demo, built by `scripts/build-wasm.sh` into `web/pkg/`.
 - `web/`: the browser frontend (canvas, keyboard, Web Audio worklet), published to GitHub Pages.

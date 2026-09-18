@@ -107,8 +107,10 @@ fn main() -> ExitCode {
         let dump_dir = env::var("GBA_DUMP_DIR").unwrap_or_else(|_| "filmstrip".into());
         // GBA_DUMP_FROM=N: skip the boot/menu frames, so a long scripted run
         // only writes the stretch being inspected.
-        let dump_from: u32 =
-            env::var("GBA_DUMP_FROM").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let dump_from: u32 = env::var("GBA_DUMP_FROM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         let trace_boot = env::var("GBA_BOOTTRACE").is_ok();
         let pc_hist: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
         let capture_audio = env::var("GBA_WAV").is_ok();
@@ -156,7 +158,8 @@ fn main() -> ExitCode {
                 // frame from GBA_DUMP_FROM on, so the regression harness sees a
                 // continuous per-frame record of the camera, the sprite anchors
                 // and the geometry rather than only the saved filmstrip frames.
-                if voxel::trace() && n >= dump_from
+                if voxel::trace()
+                    && n >= dump_from
                     && let (Some(cap), Some(dio)) = (&mut capture, &mut diorama)
                 {
                     println!("FRAME {n}");
@@ -179,7 +182,11 @@ fn main() -> ExitCode {
                     match (&mut capture, &mut diorama) {
                         (Some(cap), Some(dio)) => {
                             cap.run(&cpu.bus.io, &cpu.bus.palette, &cpu.bus.vram, &cpu.bus.oam);
-                            dio.render(cap, &cpu.bus.ppu.framebuffer, voxel::MapGrid::read(&cpu.bus, Some(cap)).as_ref());
+                            dio.render(
+                                cap,
+                                &cpu.bus.ppu.framebuffer,
+                                voxel::MapGrid::read(&cpu.bus, Some(cap)).as_ref(),
+                            );
                             dump_frame(
                                 &dio.buffer,
                                 voxel::WIDTH,
@@ -214,7 +221,11 @@ fn main() -> ExitCode {
         match (&mut capture, &mut diorama) {
             (Some(cap), Some(dio)) => {
                 cap.run(&cpu.bus.io, &cpu.bus.palette, &cpu.bus.vram, &cpu.bus.oam);
-                dio.render(cap, &cpu.bus.ppu.framebuffer, voxel::MapGrid::read(&cpu.bus, Some(cap)).as_ref());
+                dio.render(
+                    cap,
+                    &cpu.bus.ppu.framebuffer,
+                    voxel::MapGrid::read(&cpu.bus, Some(cap)).as_ref(),
+                );
                 dump_frame(&dio.buffer, voxel::WIDTH, voxel::HEIGHT, "frame.ppm");
                 // GBA_BENCH: time capture + diorama render on the final frame.
                 if env::var("GBA_BENCH").is_ok() {
@@ -225,9 +236,17 @@ fn main() -> ExitCode {
                     let tc = t.elapsed() / 100;
                     let t = std::time::Instant::now();
                     for _ in 0..100 {
-                        dio.render(cap, &cpu.bus.ppu.framebuffer, voxel::MapGrid::read(&cpu.bus, Some(cap)).as_ref());
+                        dio.render(
+                            cap,
+                            &cpu.bus.ppu.framebuffer,
+                            voxel::MapGrid::read(&cpu.bus, Some(cap)).as_ref(),
+                        );
                     }
-                    eprintln!("capture avg: {:.2?}, render avg: {:.2?}", tc, t.elapsed() / 100);
+                    eprintln!(
+                        "capture avg: {:.2?}, render avg: {:.2?}",
+                        tc,
+                        t.elapsed() / 100
+                    );
                 }
                 // GBA_GRID_DEBUG: 2D frame tinted by RAM map-grid class, to
                 // verify screen-to-grid alignment (green=grass, blue=water,
@@ -260,7 +279,10 @@ fn main() -> ExitCode {
                         let iw32 = |o: usize| {
                             u32::from_le_bytes(cpu.bus.iwram[o..o + 4].try_into().unwrap())
                         };
-                        eprint!("grid debug: MapGrid::read failed; sb1={:08X};", iw32(0x5008));
+                        eprint!(
+                            "grid debug: MapGrid::read failed; sb1={:08X};",
+                            iw32(0x5008)
+                        );
                         for o in (0..0x3FFF0).step_by(4) {
                             if ew32(o) == 0x0203_1DFC {
                                 eprint!(" ew@{:05X} (w={} h={})", o, ew32(o - 8), ew32(o - 4));
@@ -296,7 +318,12 @@ fn main() -> ExitCode {
                     dump_frame(&dbg, ppu::WIDTH, ppu::HEIGHT, "layers.ppm");
                 }
             }
-            _ => dump_frame(&cpu.bus.ppu.framebuffer, ppu::WIDTH, ppu::HEIGHT, "frame.ppm"),
+            _ => dump_frame(
+                &cpu.bus.ppu.framebuffer,
+                ppu::WIDTH,
+                ppu::HEIGHT,
+                "frame.ppm",
+            ),
         }
         if capture_audio {
             let raw: Vec<u8> = captured.iter().flat_map(|s| s.to_le_bytes()).collect();
@@ -425,7 +452,11 @@ fn main() -> ExitCode {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(600);
-    let perf_script = if perf { parse_input_script() } else { Vec::new() };
+    let perf_script = if perf {
+        parse_input_script()
+    } else {
+        Vec::new()
+    };
     use std::time::{Duration, Instant};
     let (mut perf_emu, mut perf_render, mut perf_present) =
         (Duration::ZERO, Duration::ZERO, Duration::ZERO);
@@ -505,7 +536,11 @@ fn main() -> ExitCode {
             match (&mut capture, &mut diorama) {
                 (Some(cap), Some(dio)) => {
                     cap.run(&cpu.bus.io, &cpu.bus.palette, &cpu.bus.vram, &cpu.bus.oam);
-                    dio.render(cap, &cpu.bus.ppu.framebuffer, voxel::MapGrid::read(&cpu.bus, Some(cap)).as_ref());
+                    dio.render(
+                        cap,
+                        &cpu.bus.ppu.framebuffer,
+                        voxel::MapGrid::read(&cpu.bus, Some(cap)).as_ref(),
+                    );
                     presented.copy_from_slice(&dio.buffer);
                 }
                 _ => presented.copy_from_slice(&cpu.bus.ppu.framebuffer),

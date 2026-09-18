@@ -628,10 +628,22 @@ impl Capture {
                 (2, 2) => (16, 32),
                 _ => (32, 64),
             };
-            let (bw, bh) = if affine && a0 & 0x200 != 0 { (w * 2, h * 2) } else { (w, h) };
+            let (bw, bh) = if affine && a0 & 0x200 != 0 {
+                (w * 2, h * 2)
+            } else {
+                (w, h)
+            };
             let (sy, sx) = (a0 & 0xFF, a1 & 0x1FF);
-            let oy = if sy + bh > 256 { sy as i32 - 256 } else { sy as i32 };
-            let ox = if sx + bw > 512 { sx as i32 - 512 } else { sx as i32 };
+            let oy = if sy + bh > 256 {
+                sy as i32 - 256
+            } else {
+                sy as i32
+            };
+            let ox = if sx + bw > 512 {
+                sx as i32 - 512
+            } else {
+                sx as i32
+            };
             self.sprite_boxes[i] = [ox, oy, ox + bw as i32, oy + bh as i32];
         }
         self.ui_frame.clear();
@@ -674,9 +686,7 @@ impl Capture {
                 let mut ui: Option<u8> = None;
                 'bg: for prio in 0..4u8 {
                     for bg in 0..4usize {
-                        if dispcnt & (1 << (8 + bg)) == 0
-                            || (r16(0x8 + bg * 2) & 3) as u8 != prio
-                        {
+                        if dispcnt & (1 << (8 + bg)) == 0 || (r16(0x8 + bg * 2) & 3) as u8 != prio {
                             continue;
                         }
                         let p = bg_line[bg][x];

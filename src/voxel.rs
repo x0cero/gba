@@ -51,8 +51,10 @@ const CY: f32 = 236.0;
 fn camera_scale() -> (f32, f32) {
     static K: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
     *K.get_or_init(|| {
-        let k: f32 =
-            std::env::var("GBA_3D_PERSP").ok().and_then(|v| v.parse().ok()).unwrap_or(3.0);
+        let k: f32 = std::env::var("GBA_3D_PERSP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3.0);
         let k = k.clamp(0.5, 64.0);
         (BASE_DIST * k, BASE_FOCAL * k)
     })
@@ -169,7 +171,11 @@ fn project(wx: f32, wy: f32, wz: f32) -> (f32, f32, f32) {
 /// Used for sprites, which are still screen-space drawings.
 #[inline]
 fn world(px: f32, py: f32, h: f32) -> (f32, f32, f32) {
-    (px - ppu::WIDTH as f32 / 2.0, h, ppu::HEIGHT as f32 / 2.0 - py)
+    (
+        px - ppu::WIDTH as f32 / 2.0,
+        h,
+        ppu::HEIGHT as f32 / 2.0 - py,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -440,14 +446,24 @@ pub enum Cell {
     /// composed picture as one quad. Every cell of the unit draws shadowed
     /// grass as its floor — never its own art, which is what used to lay
     /// canopies out flat as pale shelves.
-    Tree { w: u8, h: u8, dx: u8, dy: u8 },
+    Tree {
+        w: u8,
+        h: u8,
+        dx: u8,
+        dy: u8,
+    },
     /// Part of a solid volume standing on this cell.
     ///
     /// `h` world height, `n` cells the volume spans north-to-south, `k` this
     /// cell's index from the volume's north edge, `wall` how many of the
     /// volume's southernmost cells are its drawn front (0 = the art has no
     /// front, so the face is painted flat instead of folded).
-    Block { h: f32, n: u8, k: u8, wall: u8 },
+    Block {
+        h: f32,
+        n: u8,
+        k: u8,
+        wall: u8,
+    },
 }
 
 /// A window of FireRed's live map grid around the player, in MAP coordinates,
@@ -510,12 +526,18 @@ thread_local! {
 }
 
 /// Southern rows of a built volume that stand up as its front (GBA_3D_WALL,
-/// default 2). See `structure()` for why this is the knob that controls how
-/// much ground a building hides.
+/// default 1: the half-height wall that keeps the ground behind a building
+/// readable, which every regression scenario is tuned against). See
+/// `structure()` for why this is the knob that controls how much ground a
+/// building hides.
 fn wall_steps() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("GBA_3D_WALL").ok().and_then(|v| v.parse().ok()).unwrap_or(2).clamp(1, 3)
+        std::env::var("GBA_3D_WALL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1)
+            .clamp(1, 3)
     })
 }
 
@@ -578,8 +600,14 @@ impl MapGrid {
             }
         };
         let rd16 = |a: u32| Some(u16::from_le_bytes([rd8(a)?, rd8(a + 1)?]));
-        let rd32 =
-            |a: u32| Some(u32::from_le_bytes([rd8(a)?, rd8(a + 1)?, rd8(a + 2)?, rd8(a + 3)?]));
+        let rd32 = |a: u32| {
+            Some(u32::from_le_bytes([
+                rd8(a)?,
+                rd8(a + 1)?,
+                rd8(a + 2)?,
+                rd8(a + 3)?,
+            ]))
+        };
 
         let vwidth = rd32(0x0300_5040)? as i32; // map width + 15 border cells
         let vheight = rd32(0x0300_5044)? as i32;
@@ -614,7 +642,9 @@ impl MapGrid {
         };
         let dbg = std::env::var("GBA_3D_DEBUG").is_ok();
         if dbg {
-            eprintln!("grid: vw={vwidth} vh={vheight} grid={grid_ptr:08X} sb1={sb1:08X} p=({px},{py}) layout={layout:08X}");
+            eprintln!(
+                "grid: vw={vwidth} vh={vheight} grid={grid_ptr:08X} sb1={sb1:08X} p=({px},{py}) layout={layout:08X}"
+            );
         }
         let (tprim, tsec) = (tileset(layout + 0x10)?, tileset(layout + 0x14)?);
         let field = |t: u32, off: u32| -> Option<u32> {
@@ -624,7 +654,9 @@ impl MapGrid {
         let (aprim, asec) = (field(tprim, 0x14)?, field(tsec, 0x14)?);
         let (mprim, msec) = (field(tprim, 0x0C)?, field(tsec, 0x0C)?);
         if dbg {
-            eprintln!("grid: tsets {tprim:08X}/{tsec:08X} meta {mprim:08X}/{msec:08X} attr {aprim:08X}/{asec:08X}");
+            eprintln!(
+                "grid: tsets {tprim:08X}/{tsec:08X} meta {mprim:08X}/{msec:08X} attr {aprim:08X}/{asec:08X}"
+            );
         }
 
         // THE REAL MAP'S OWN SIZE, and which sides of it lead somewhere.
@@ -690,8 +722,20 @@ impl MapGrid {
         // Live grid entry: metatile id 0-9, collision 10-11, elevation 12-15.
         // VMap coordinates are map coordinates + 7 (the border margin).
         let entry = |gx: i32, gy: i32| -> Option<u16> {
-            let out_we = if gx < 0 { 3 } else if gx >= mapw { 4 } else { 0 };
-            let out_ns = if gy < 0 { 2 } else if gy >= maph { 1 } else { 0 };
+            let out_we = if gx < 0 {
+                3
+            } else if gx >= mapw {
+                4
+            } else {
+                0
+            };
+            let out_ns = if gy < 0 {
+                2
+            } else if gy >= maph {
+                1
+            } else {
+                0
+            };
             let outside = out_we != 0 || out_ns != 0;
             if !outside {
                 let (vx, vy) = (gx + 7, gy + 7);
@@ -705,7 +749,9 @@ impl MapGrid {
             // On a connected side the live grid already carries the
             // neighbour's cells; use them if they exist.
             if outside {
-                let has_conn = [out_we, out_ns].iter().all(|&d| d == 0 || conn & 1 << d != 0);
+                let has_conn = [out_we, out_ns]
+                    .iter()
+                    .all(|&d| d == 0 || conn & 1 << d != 0);
                 if has_conn && !(out_we != 0 && out_ns != 0) {
                     let (vx, vy) = (gx + 7, gy + 7);
                     if vx >= 0 && vy >= 0 && vx < vwidth && vy < vheight {
@@ -731,7 +777,11 @@ impl MapGrid {
         };
         let attrs = |e: u16| -> u32 {
             let m = (e & 0x3FF) as u32;
-            let a = if m < 0x280 { rd32(aprim + m * 4) } else { rd32(asec + (m - 0x280) * 4) };
+            let a = if m < 0x280 {
+                rd32(aprim + m * 4)
+            } else {
+                rd32(asec + (m - 0x280) * 4)
+            };
             a.unwrap_or(0)
         };
         let behavior = |e: u16| attrs(e) & 0x1FF;
@@ -887,7 +937,7 @@ impl MapGrid {
             // The fine scroll comes straight from the ground layer's own
             // register and is never wrong, so only whole cells are searched.
             let mut best = (score(camx, camy), 0i32, 0i32);
-            if best.0 .0 * 4 < best.0 .1 * 3 {
+            if best.0.0 * 4 < best.0.1 * 3 {
                 for r in 1..=3i32 {
                     for dy in -r..=r {
                         for dx in -r..=r {
@@ -895,12 +945,12 @@ impl MapGrid {
                                 continue;
                             }
                             let s = score(camx + dx * 16, camy + dy * 16);
-                            if s.0 * best.0 .1 > best.0 .0 * s.1 {
+                            if s.0 * best.0.1 > best.0.0 * s.1 {
                                 best = (s, dx, dy);
                             }
                         }
                     }
-                    if best.0 .0 * 4 >= best.0 .1 * 3 {
+                    if best.0.0 * 4 >= best.0.1 * 3 {
                         break;
                     }
                 }
@@ -925,7 +975,15 @@ impl MapGrid {
                 camy += best.2 * 16;
             }
         }
-        CAM.with(|c| c.set(Some(Cam { hofs, vofs, x: camx, y: camy, map: grid_ptr })));
+        CAM.with(|c| {
+            c.set(Some(Cam {
+                hofs,
+                vofs,
+                x: camx,
+                y: camy,
+                map: grid_ptr,
+            }))
+        });
         let fine = (camx.rem_euclid(16) as usize, camy.rem_euclid(16) as usize);
         let (gx0, gy0) = (camx.div_euclid(16) - 7 - MX, camy.div_euclid(16) - 5 - MY_N);
         if std::env::var("GBA_3D_CAM").is_ok() {
@@ -1037,7 +1095,9 @@ impl MapGrid {
             if blackout(gx, gy) {
                 return Kind::Open;
             }
-            let Some(e) = entry(gx, gy) else { return Kind::Open };
+            let Some(e) = entry(gx, gy) else {
+                return Kind::Open;
+            };
             if e >> 10 & 3 == 0 || is_water(e) {
                 return Kind::Open;
             }
@@ -1107,7 +1167,8 @@ impl MapGrid {
             // Inside the window the classification is already computed; only a
             // unit straddling the window edge pays for a fresh one.
             let (cx, cy) = (gx - gx0, gy - gy0);
-            let k = if (0..Self::COLS as i32).contains(&cx) && (0..Self::ROWS as i32).contains(&cy) {
+            let k = if (0..Self::COLS as i32).contains(&cx) && (0..Self::ROWS as i32).contains(&cy)
+            {
                 kinds[cy as usize * Self::COLS + cx as usize]
             } else {
                 kind(gx, gy)
@@ -1134,7 +1195,9 @@ impl MapGrid {
             let (gx, gy) = (gx0 + cx, gy0 + cy);
             let (mut ax, mut ay) = (gx, gy);
             while gx - ax < 3
-                && plant_id(ax - 1, ay).zip(plant_id(ax, ay)).is_some_and(|(w, c)| hstep(w, c))
+                && plant_id(ax - 1, ay)
+                    .zip(plant_id(ax, ay))
+                    .is_some_and(|(w, c)| hstep(w, c))
             {
                 ax -= 1;
             }
@@ -1188,7 +1251,12 @@ impl MapGrid {
                 let cell = match kind_at(cx, cy) {
                     Kind::Plant => {
                         let (ax, ay, w, h) = unit(cx, cy);
-                        Cell::Tree { w, h, dx: (cx - ax) as u8, dy: (cy - ay) as u8 }
+                        Cell::Tree {
+                            w,
+                            h,
+                            dx: (cx - ax) as u8,
+                            dy: (cy - ay) as u8,
+                        }
                     }
                     Kind::Thin => Cell::Bill,
                     Kind::Struct => Self::structure(gx, gy, &kind, &entry),
@@ -1379,10 +1447,20 @@ impl MapGrid {
         // it is.
         let thick = kind(gx - 1, gy) == Kind::Struct || kind(gx + 1, gy) == Kind::Struct;
         if !thick {
-            return Cell::Block { h: STEP, n: 1, k: 0, wall: 0 };
+            return Cell::Block {
+                h: STEP,
+                n: 1,
+                k: 0,
+                wall: 0,
+            };
         }
         if (0..len - 1).all(|i| id(i) == id(i + 1)) {
-            return Cell::Block { h: STEP, n: 1, k: 0, wall: 0 };
+            return Cell::Block {
+                h: STEP,
+                n: 1,
+                k: 0,
+                wall: 0,
+            };
         }
         // How many of a volume's southern rows stand up as its front, and so
         // how tall the volume is. This is the single number that decides how
@@ -1401,8 +1479,17 @@ impl MapGrid {
         // counter, a bank of shelves; walls and buildings run longer. Half a
         // step reads as raised furniture and leaves a person behind it visible
         // from the waist up, which is what the game shows.
-        let h = if len == 2 { STEP * 0.5 } else { STEP * wall as f32 };
-        Cell::Block { h, n: len as u8, k: j as u8, wall }
+        let h = if len == 2 {
+            STEP * 0.5
+        } else {
+            STEP * wall as f32
+        };
+        Cell::Block {
+            h,
+            n: len as u8,
+            k: j as u8,
+            wall,
+        }
     }
 
     /// The camera's position in map pixels. FireRed locks the camera to the
@@ -1412,7 +1499,10 @@ impl MapGrid {
     /// the player is, which is why the sprite anchor is built on it.
     #[inline]
     pub fn camera(&self) -> (i32, i32) {
-        ((self.gx0 + 7 + MX) * 16 + self.fine.0 as i32, (self.gy0 + 5 + MY_N) * 16 + self.fine.1 as i32)
+        (
+            (self.gx0 + 7 + MX) * 16 + self.fine.0 as i32,
+            (self.gy0 + 5 + MY_N) * 16 + self.fine.1 as i32,
+        )
     }
 
     /// World x / world z of a map-pixel coordinate. Identical to what `world()`
@@ -1733,8 +1823,16 @@ impl Renderer {
     /// Textured quad: vertices clockwise from top-left, uv (0,0) at q[0],
     /// (1,0) at q[1], (1,1) at q[2], (0,1) at q[3].
     fn quad_uv(&mut self, q: [(f32, f32, f32); 4], sample: &mut impl FnMut(f32, f32) -> u32) {
-        self.tri_uv([q[0], q[1], q[2]], [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)], sample);
-        self.tri_uv([q[0], q[2], q[3]], [(0.0, 0.0), (1.0, 1.0), (0.0, 1.0)], sample);
+        self.tri_uv(
+            [q[0], q[1], q[2]],
+            [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
+            sample,
+        );
+        self.tri_uv(
+            [q[0], q[2], q[3]],
+            [(0.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+            sample,
+        );
     }
 
     fn quad_uv_ghost(
@@ -1743,8 +1841,18 @@ impl Renderer {
         sample: &mut impl FnMut(f32, f32) -> u32,
         mode: Ghost,
     ) {
-        self.tri_uv_mode([q[0], q[1], q[2]], [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)], sample, mode);
-        self.tri_uv_mode([q[0], q[2], q[3]], [(0.0, 0.0), (1.0, 1.0), (0.0, 1.0)], sample, mode);
+        self.tri_uv_mode(
+            [q[0], q[1], q[2]],
+            [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
+            sample,
+            mode,
+        );
+        self.tri_uv_mode(
+            [q[0], q[2], q[3]],
+            [(0.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+            sample,
+            mode,
+        );
     }
 
     /// Blit a 240x160 frame at 3x nearest-neighbor, centered. `opaque_only`
@@ -2073,9 +2181,10 @@ impl Renderer {
 
                 // West and east faces. Top-down art has no side view at all,
                 // so these are always flat material, never folded.
-                for (west, plane, nb) in
-                    [(true, x0, g.neighbor_h(cx - 1, cy)), (false, x1, g.neighbor_h(cx + 1, cy))]
-                {
+                for (west, plane, nb) in [
+                    (true, x0, g.neighbor_h(cx - 1, cy)),
+                    (false, x1, g.neighbor_h(cx + 1, cy)),
+                ] {
                     if nb >= h {
                         continue;
                     }
@@ -2198,14 +2307,21 @@ impl Renderer {
             if g == usize::MAX {
                 continue;
             }
-            let Some(&b) = cap.sprite_boxes.get(obj) else { continue };
+            let Some(&b) = cap.sprite_boxes.get(obj) else {
+                continue;
+            };
             if b[2] <= b[0] {
                 continue;
             }
             let r = root(&mut find, g);
             oam_box[r] = Some(match oam_box[r] {
                 None => b,
-                Some(o) => [o[0].min(b[0]), o[1].min(b[1]), o[2].max(b[2]), o[3].max(b[3])],
+                Some(o) => [
+                    o[0].min(b[0]),
+                    o[1].min(b[1]),
+                    o[2].max(b[2]),
+                    o[3].max(b[3]),
+                ],
             });
         }
         // WHICH FIGURE IS THE PLAYER: EXACTLY ONE OF THEM.
@@ -2263,8 +2379,16 @@ impl Renderer {
             // leaves between its cell and its drawing, measured off whichever
             // edges of this very figure are NOT clipped.
             if let Some(b) = oam_box[fig] {
-                let padl = if min_x > 0.0 { min_x - b[0] as f32 } else { 0.0 };
-                let padr = if max_x < W as f32 { b[2] as f32 - max_x } else { 0.0 };
+                let padl = if min_x > 0.0 {
+                    min_x - b[0] as f32
+                } else {
+                    0.0
+                };
+                let padr = if max_x < W as f32 {
+                    b[2] as f32 - max_x
+                } else {
+                    0.0
+                };
                 if min_x <= 0.0 {
                     min_x = b[0] as f32 + padr;
                 }
@@ -2321,7 +2445,11 @@ impl Renderer {
                 // flickers between two cells frame to frame. Anything under
                 // three quarters of a cell is the camera's own figure.
                 let snap = |d: i32| {
-                    if d.abs() < 12 { 0 } else { (d as f32 / 16.0).round() as i32 * 16 }
+                    if d.abs() < 12 {
+                        0
+                    } else {
+                        (d as f32 / 16.0).round() as i32 * 16
+                    }
                 };
                 (
                     camx + snap(measured.0 - camx),
@@ -2397,9 +2525,17 @@ impl Renderer {
                 // which on a bank is the water.
                 let zc = wz0 + cw * 0.35;
                 let pt = |a: f32| {
-                    project(cxw + cw * 0.85 * a.cos(), ground + 0.15, zc + cw * 0.35 * a.sin())
+                    project(
+                        cxw + cw * 0.85 * a.cos(),
+                        ground + 0.15,
+                        zc + cw * 0.35 * a.sin(),
+                    )
                 };
-                self.tri([project(cxw, ground + 0.15, zc), pt(a0), pt(a1)], 0, Some(0.55));
+                self.tri(
+                    [project(cxw, ground + 0.15, zc), pt(a0), pt(a1)],
+                    0,
+                    Some(0.55),
+                );
             }
 
             let hart = feet - top;
@@ -2442,7 +2578,11 @@ impl Renderer {
                 // Only this figure's own pixels: the quads of two characters
                 // standing side by side overlap, and without the mask each
                 // would paint bits of the other at its own depth.
-                if owner[i] != fig as u16 { SKIP } else { grid[i] & 0x00FF_FFFF }
+                if owner[i] != fig as u16 {
+                    SKIP
+                } else {
+                    grid[i] & 0x00FF_FFFF
+                }
             };
             self.counting = true;
             self.cov = 0;
@@ -2535,7 +2675,9 @@ impl Renderer {
             // ordinary half-cover, and every NPC standing in tall grass or
             // behind a sign would start ghosting through it.
             let front = probe(ax, ay - 8).or_else(|| {
-                player.then(|| probe(mgrid.player.0 * 16 + 8, mgrid.player.1 * 16 + 8)).flatten()
+                player
+                    .then(|| probe(mgrid.player.0 * 16 + 8, mgrid.player.1 * 16 + 8))
+                    .flatten()
             });
             let behind_volume = front.is_some();
             let center_dist =
@@ -2573,7 +2715,11 @@ impl Renderer {
                 self.quad_uv_ghost(
                     q,
                     &mut |u, v| if v < cut { sampler(u, v) } else { SKIP },
-                    if behind_volume { Ghost::Solid } else { Ghost::Faint },
+                    if behind_volume {
+                        Ghost::Solid
+                    } else {
+                        Ghost::Faint
+                    },
                 );
             }
             if trace() {
@@ -2735,7 +2881,11 @@ impl Renderer {
             if id != NO_TREE && m == 0.0 {
                 continue;
             }
-            let (r, g, b) = ((*c >> 16 & 0xFF) as f32, (*c >> 8 & 0xFF) as f32, (*c & 0xFF) as f32);
+            let (r, g, b) = (
+                (*c >> 16 & 0xFF) as f32,
+                (*c >> 8 & 0xFF) as f32,
+                (*c & 0xFF) as f32,
+            );
             let luma = 0.299 * r + 0.587 * g + 0.114 * b;
             // Out in the margin the lift runs the other way: colour drains out
             // and the light goes with it, so the sides read as distance rather
