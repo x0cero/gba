@@ -35,6 +35,7 @@ Exit code is 0 only when every check passes.
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -89,7 +90,7 @@ BEHIND = "2020-2040:up,2060-2260:right,2280-2300:down,2320-2560:left"
 
 class Frame:
     __slots__ = ("n", "cam", "fine", "player", "figs", "sha", "geom",
-                 "mapsize", "seen", "hide", "trees")
+                 "mapsize", "seen", "hide", "trees", "models")
 
     def __init__(self, n):
         self.n = n
@@ -99,6 +100,7 @@ class Frame:
         self.hide = []
         self.trees = {}
         self.geom = {}
+        self.models = {}
 
 
 def run(binary, rom, script, frames, dump_from=LIVE, geom=False, extra=None):
@@ -114,12 +116,12 @@ def run(binary, rom, script, frames, dump_from=LIVE, geom=False, extra=None):
     # Headless exit rewrites <rom>.sav, so every run works on a private copy.
     with tempfile.TemporaryDirectory() as td:
         r = os.path.join(td, "rom.gba")
-        os.link(rom, r) if False else subprocess.run(["cp", rom, r], check=True)
+        shutil.copyfile(rom, r)
         if os.path.exists(rom + ".sav"):
-            subprocess.run(["cp", rom + ".sav", r + ".sav"], check=True)
+            shutil.copyfile(rom + ".sav", r + ".sav")
         out = subprocess.run([binary, r, "--headless", "--3d"], env=env,
                              stdout=subprocess.PIPE,
-                             stderr=subprocess.STDOUT, text=True)
+                             stderr=subprocess.STDOUT, text=True, check=True)
     return parse(out.stdout)
 
 
@@ -164,6 +166,8 @@ def parse(text):
                                  vis=int(f[9]), ghost=f[11] == "1"))
         elif f[0] == "TREE":
             cur.trees[(int(f[1]), int(f[2]))] = (int(f[4]), int(f[6]))
+        elif f[0] == "MODEL":
+            cur.models[(f[1], int(f[2]), int(f[3]))] = tuple(f[4:])
         elif f[0] == "SHA":
             cur.sha = f[1]
         elif f[0] == "GEOM":
@@ -304,6 +308,47 @@ def check_warps(frames):
     return bad[:5], f"{warps - 1} map changes, {len(frames)} frames"
 
 
+def check_furniture(frames):
+    """Items sit on the table, while the player stays on the floor."""
+    frames = [f for f in frames if f.mapsize == (13, 14) and f.geom]
+    if not frames:
+        return ["no lab geometry captured"], "n/a"
+    f = frames[-1]
+    bad = []
+    for cell in [(8, 4), (9, 4), (10, 4), (4, 1), (5, 1)]:
+        shape = f.geom.get(cell, "")
+        height = float(shape[1:].split(":")[0]) if shape.startswith("K") else 0
+        items = [g for g in f.figs if g["cell"] == cell and not g["player"]]
+        if height <= 0 or len(items) != 1 or items[0]["ground"] != height:
+            bad.append(f"item at {cell} is not seated on its table surface")
+        elif cell[1] == 1:
+            visibility = next((h for h in f.hide if h["idx"] == items[0]["idx"]), None)
+            if not visibility or visibility["vis"] < visibility["cov"] * 0.95:
+                bad.append(f"book at {cell} is still clipped by the desk or wall")
+    player = player_fig(f)
+    if not player or player["ground"] != 0:
+        bad.append("player was lifted off the aisle floor")
+    if not f.geom.get((1, 8), "").startswith("K"):
+        bad.append("bookcase is still a flat billboard")
+    return bad, "three balls and two books on surfaces; books visible; player on floor"
+
+
+def check_aisle_marker(frames):
+    bad, checked = [], 0
+    for f in frames:
+        player = player_fig(f)
+        if not player or player["cell"] not in [(7, 5), (8, 5)]:
+            continue
+        h = next((h for h in f.hide if h["player"]), None)
+        if h:
+            checked += 1
+            if h["ghost"] or h["vis"] != h["cov"]:
+                bad.append(f"frame {f.n}: marker or occlusion in the open aisle")
+    if checked < 20:
+        bad.append(f"only {checked} aisle frames checked")
+    return bad[:5], f"{checked} frames beside the table, {len(bad)} false occlusions"
+
+
 def check_npc(frames):
     """Only one figure is ever the player, and every other figure stands on
     the map rather than travelling with the camera.
@@ -415,12 +460,10 @@ def check_trees(frames, at):
     """Every pixel a tree billboard paints is still exactly that colour in the
     finished frame.
 
-    A tree in the diorama is the game's own metatile artwork, decoded from the
-    same ROM tables and VRAM tiles the PPU draws the 2D frame from, so a tree
-    pixel that nothing touches afterwards IS the 2D render's pixel. Anything
-    that blends over it -- the tilt-shift blur, which let neighbouring canopies
-    show through one another, or the saturation lift, which moved every canopy
-    off the game's palette -- shows up here and nowhere else.
+    The renderer records the color each tree paints, from lit mesh materials
+    in modeled mode or the original artwork in sprite mode. Post-processing
+    must preserve those colors in the central focus area. This is a stability
+    check, not a claim that modeled trees match the 2D artwork pixel for pixel.
     """
     win = [f for f in frames if f.n == at and f.trees]
     if not win:
@@ -524,6 +567,16 @@ def main():
                 dump_from=2400)
         report("interior.determinism", *check_determinism(fr, b))
 
+    if want("interior") or want("furniture"):
+        furniture = run(args.binary, args.rom, ENTER + ",2680-2790:up", 2820,
+                        dump_from=2818, geom=True)
+        report("interior.furniture", *check_furniture(furniture))
+
+    if want("interior") or want("occlusion"):
+        aisle = run(args.binary, args.rom, ENTER + ",2680-2790:up,2820-2855:right",
+                    2890, dump_from=2818)
+        report("interior.occlusion", *check_aisle_marker(aisle))
+
     if want("trees"):
         # His own viewpoint, not a convenient one: the west tree border and the
         # town's north tree row, seen from where he stands in the screenshot.
@@ -560,6 +613,22 @@ def main():
         b = run(args.binary, args.rom, "1505-1560:left", 1600, dump_from=1599,
                 geom=True)
         report("geometry.stable", *check_geometry(a, b))
+
+    if want("models") and os.environ.get("GBA_3D_STYLE") == "modeled":
+        a = run(args.binary, args.rom, "", 1540, dump_from=1539)
+        b = run(args.binary, args.rom, "1505-1560:left", 1600, dump_from=1599)
+        first, second = a[-1].models, b[-1].models
+        common = set(first) & set(second)
+        bad = [f"{key}: model changed while walking" for key in common
+               if first[key] != second[key]]
+        for kind in ("tree", "building"):
+            if not any(key[0] == kind for key in common):
+                bad.append(f"no shared {kind} models, so this proves nothing")
+        report("models.stable", bad, f"{len(common)} shared model instances")
+        inside = run(args.binary, args.rom, ENTER, 2650, dump_from=2649)
+        report("models.interior", ["outdoor models appeared inside Oak's lab"]
+               if any(f.models for f in inside) else [],
+               "indoor furniture retains its own geometry")
 
     print()
     fails = [r for r in results if not r[1]]

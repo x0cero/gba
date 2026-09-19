@@ -2,9 +2,13 @@
 
 [![CI](https://github.com/x0cero/gba/actions/workflows/ci.yml/badge.svg)](https://github.com/x0cero/gba/actions/workflows/ci.yml)
 
-Game Boy Advance emulator written from scratch in Rust. Runs Pokémon FireRed, frame-identical to mGBA.
+Game Boy Advance emulator written from scratch in Rust, with an experimental 3D view for Pokémon FireRed. The original 2D renderer matched mGBA in a 9,000-frame scripted comparison.
+
+**[Download v1.2.0](https://github.com/x0cero/gba/releases/tag/v1.2.0)** for macOS, Windows, or Linux. This release improves 3D characters, interiors and hidden-player markers. See the [changelog](CHANGELOG.md).
 
 **[Play it in your browser](https://x0cero.github.io/gba/)**: the same Rust core compiled to WebAssembly. Drop in your own `.gba` file, or click "Run CPU test suite" to see the emulator work without one.
+
+The browser version uses the original 2D display. The 3D view requires the desktop download.
 
 No emulation libraries and no ported reference code: the ARM7TDMI core, the PPU, the DMA controller, the timers, the save hardware and the audio path were each built against the hardware documentation and test ROMs, one failing case at a time. No BIOS image is required; the BIOS calls games actually make are implemented in high-level Rust.
 
@@ -38,7 +42,7 @@ On the standard suites, the CPU core passes the jsmolka `arm`, `thumb` and `memo
 - **Audio**: both DirectSound FIFO channels plus all four PSG channels, mixed with output headroom and a low-pass filter, paced off the audio clock so the picture does not drift against the sound.
 - **Every common save medium, auto-detected**: 32 KB SRAM, 64 KB flash (Panasonic), 128 KB two-bank flash (Sanyo), and bit-serial EEPROM over DMA3 in both the 512 byte and 8 KB variants. The medium is inferred from the SDK marker string left in the ROM, and the emulator prints which one it chose at startup.
 - **Quality of life**: save states, pause, and hold-to-fast-forward.
-- **3D diorama mode** (`--3d`): renders the overworld of Pokémon FireRed as a tilted miniature built from the game's live map data, with no per-game hand profiling. See below.
+- **3D diorama mode** (`--3d`): renders the overworld of Pokémon FireRed as a tilted miniature built from the game's live map data, reusing its original artwork on map-based geometry. See below.
 - **iOS frontend**: a SwiftUI app in `ios/` that drives the same Rust core through a C FFI layer, with touch controls, a game library, and MFi controller support.
 
 ## Building and running
@@ -77,11 +81,25 @@ Battery saves are written to `<rom>.gba.sav` next to the ROM, sized to whatever 
 
 ![Pokémon FireRed, Pallet Town rendered as a 3D diorama](screenshots/firered-3d-pallet-town.png)
 
-The 2D game is still running exactly as before; `--3d` only changes how the picture is drawn. Every frame, the renderer reads the game's own map grid out of RAM (the walkability and metatile layers FireRed uses for collision), reads the metatile artwork out of the ROM, and rebuilds the visible area as a small scene: walkable cells and tall grass lie flat, water sinks, buildings and fences rise to a half-height wall, and trees stand as their whole art unit. Characters are drawn as billboards pinned to their feet and leaning back to the camera pitch, with contact shadows, and the player is cut out over any roof that would hide him. The camera is integrated from the scroll registers and then checked against the drawn picture every frame; if the two disagree (battles, menus, the title screen, warp fades) the frame is shown in plain 2D and the diorama comes back when the overworld does. Dialogue and menus are composited flat on top, and a tilt-shift pass finishes the miniature look.
+![Oak's lab with original textures, upright furniture and visible desk items](screenshots/firered-3d-lab.png)
 
-Nothing about this is hand-authored per map. The geometry comes from the same data the game uses to decide where you can walk, so it holds across the whole overworld and inside buildings. It is tuned for FireRed and LeafGreen; the map and art decoding assume their layout, and other games fall back to 2D.
+The original game still runs in the emulator; `--3d` changes how the scene is drawn. The default view keeps FireRed's original tree artwork and building textures. Trees stand as whole artwork units, buildings are extruded from the live map, and characters remain sprites. Active overworld characters use complete sprite tiles, including those outside the original 240×160 screen. Windows and doors stay on building fronts, and a tinted marker shows the player behind scenery. Indoor bookcases combine their cap, shelves and base into solid cabinets; supported back walls stand upright. Oak’s lab has verified profiles for its table, round machine and book stands. Table items use the surface height; equipment keeps its complete original outline instead of being extruded tile by tile. Other furniture still uses the general tile classifier. Map borders use the dimensions stored in the ROM. Battles and full-screen menus fall back to 2D; dialogue is overlaid on the scene.
 
-`tools/regress3d.py` drives scripted playthroughs around Pallet Town and inside Oak's lab and checks camera smoothness, figure placement, warps, tree pixel-accuracy and determinism by numbers rather than by eye. Tuning knobs, all environment variables read at launch: `GBA_3D_WALL` (wall height in steps, 1 to 3, default 1), `GBA_3D_PERSP` (lens, default 3, 1 is the wide lens), `GBA_TILT` (tilt-shift strength 0 to 3, default 2), `GBA_TREE_TALL`, `GBA_MARGIN` (edge fall-off, 0 turns it off). The 3D mode is native only; the browser demo and the iOS app stay 2D.
+The experimental polygon-tree and pitched-roof version is opt-in only:
+
+```sh
+GBA_3D_STYLE=modeled ./target/release/gba path/to/firered.gba --3d
+```
+
+`tools/regress3d.py` checks camera motion, figure placement, warps, post-processing and determinism. It also checks model stability when run with `GBA_3D_STYLE=modeled`. `cargo test` covers save hardware, border decoding, renderer history, mesh geometry and perspective texture interpolation. The main tuning variables are `GBA_3D_PERSP` (lens, default 3), `GBA_TILT` (blur, 0 to 3, default 2 for the original style), `GBA_MARGIN` (edge fading), `GBA_TREE_TALL`, `GBA_WOOD`, and `GBA_3D_WALL`. The 3D renderer is native desktop only.
+
+The silhouette uses scenery depth captured before any character is drawn, shared by all maps. Run the optional ROM layout audit with:
+
+```sh
+GBA_AUDIT_ROM=/path/to/firered.gba cargo test --release --bin gba all_rom_layouts -- --ignored --nocapture
+```
+
+This reads a local US FireRed ROM without opening or writing saves. It discovers layout records, loads their tile graphics and palettes, and checks silhouette masking at the center and four corners under both indoor and outdoor boundary rules. It includes unused layouts. The audit uses a synthetic character mask and reconstructed map grids, so it tests scenery depth and masking, not live NPC behavior, connected-map transitions, animated tiles, or whether each furniture shape is visually correct. Normal unit tests also cover partial scenery coverage, transparent sprite pixels, screen clipping and foreground characters.
 
 ## Architecture
 
@@ -89,7 +107,10 @@ Nothing about this is hand-authored per map. The geometry comes from the same da
 - `src/bus.rs`: the memory map and everything hanging off it. DMA, timers, the interrupt controller, the keypad, save-chip emulation, the BIOS high-level calls, and the DirectSound mixer.
 - `src/ppu.rs`: the scanline renderer and the LCD state machine.
 - `src/psg.rs`: the four legacy Game Boy sound channels.
-- `src/voxel.rs`: the `--3d` diorama renderer, and the per-frame layer capture in `src/ppu.rs` that feeds it.
+- `src/voxel.rs`: map decoding, camera tracking and rasterization for `--3d`.
+- `src/voxel/actors.rs`: full overworld sprites and positions from FireRed’s live object events. Distant actors that the game has completely unloaded remain outside this path.
+- `src/voxel/interiors.rs`: indoor cabinet units, back walls and the lab table profile.
+- `src/voxel/models.rs`: procedural tree meshes and outdoor building geometry. Per-frame layer capture lives in `src/ppu.rs`.
 - `src/lib.rs`: the C FFI surface that the iOS app links against.
 - `src/wasm.rs`: the wasm-bindgen surface behind the browser demo, built by `scripts/build-wasm.sh` into `web/pkg/`.
 - `web/`: the browser frontend (canvas, keyboard, Web Audio worklet), published to GitHub Pages.
@@ -114,7 +135,8 @@ These are honest trade-offs, documented rather than hidden.
 - **Some SWI calls are unimplemented.** The set games actually reach is covered; the rest fall through rather than being emulated.
 - **Modes 1 and 2 affine backgrounds are lightly exercised**, since the games tested here do not use them heavily.
 - **A ROM with no save marker at all falls back to 128 KB flash**, which is a guess rather than a detection.
-- **Test coverage is narrow.** `cargo test` covers the save controllers (medium detection, the flash command protocol, the EEPROM bit protocol, and `.sav` sizing). The wider accuracy claim rests on the test ROM suites and the mGBA comparison, not on unit tests.
+- **3D geometry remains experimental.** Some furniture and unusual buildings still use heuristic shapes. Active characters outside the original viewport are rendered, but characters completely unloaded by the game can still pop in.
+- **Coverage has limits.** Unit tests cover save hardware and renderer behavior; gameplay regressions exercise selected routes and interiors. The ROM layout audit checks silhouette masking, not every visual detail or scripted event. The 2D accuracy claim rests on the documented test ROM suites and mGBA comparison.
 
 ## License
 

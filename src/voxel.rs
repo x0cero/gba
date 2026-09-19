@@ -14,12 +14,18 @@
 //! same solid object at the same height on every frame, the world simply
 //! extends past the visible frame, and there is no edge ramp to speak of.
 //!
-//! Sprites still come from the captured PPU pixels (they are drawings, not map
-//! data) and are drawn as flat feet-pivoted billboards leaning back by the
-//! camera pitch, with contact shadows and an occlusion silhouette. BG0 UI
+//! Characters use complete live sprite tiles and engine positions, including
+//! active actors outside the GBA viewport. They stand as feet-pivoted
+//! billboards with contact shadows and a hidden-player marker. BG0 UI
 //! composites flat on top. Everything is software-rasterized (z-buffered).
 use gba::bus::Bus;
 use gba::ppu::{self, Capture};
+
+mod actors;
+mod interiors;
+#[cfg(test)]
+mod map_audit;
+mod models;
 
 pub const WIDTH: usize = 800;
 pub const HEIGHT: usize = 500;
@@ -480,6 +486,10 @@ pub struct MapGrid {
     pub gy0: i32,
     pub player: (i32, i32),
     pub mapsize: (i32, i32),
+    indoors: bool,
+    interior: Vec<interiors::Part>,
+    model_floor: usize,
+    actors: actors::Scene,
     pub cells: Vec<Cell>,
     /// Art slot per cell.
     slots: Vec<u32>,
@@ -517,12 +527,143 @@ struct Cam {
     map: u32,
 }
 
+/// Repeating scenery outside the map. Dimensions belong to each map layout;
+/// reading a fixed 4x4 block can pull unrelated map tiles out of the ROM.
+struct Border {
+    width: i32,
+    height: i32,
+    tiles: Vec<u16>,
+}
+
+impl Border {
+    fn read(layout: u32, rd8: &impl Fn(u32) -> Option<u8>) -> Option<Self> {
+        let width = rd8(layout.checked_add(0x18)?)? as i32;
+        let height = rd8(layout.checked_add(0x19)?)? as i32;
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let ptr = u32::from_le_bytes([
+            rd8(layout.checked_add(8)?)?,
+            rd8(layout.checked_add(9)?)?,
+            rd8(layout.checked_add(10)?)?,
+            rd8(layout.checked_add(11)?)?,
+        ]);
+        if !matches!(ptr >> 24, 8 | 9) {
+            return None;
+        }
+        let tiles = (0..width * height)
+            .map(|i| {
+                let a = ptr.checked_add(i as u32 * 2)?;
+                Some(u16::from_le_bytes([rd8(a)?, rd8(a.checked_add(1)?)?]))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            width,
+            height,
+            tiles,
+        })
+    }
+
+    fn at(&self, gx: i32, gy: i32) -> Option<u16> {
+        let x = gx.rem_euclid(self.width);
+        let y = gy.rem_euclid(self.height);
+        let e = self.tiles[(y * self.width + x) as usize];
+        (e & 0x3FF != 0x3FF).then_some(e | 0x0C00)
+    }
+}
+
 thread_local! {
     static CAM: std::cell::Cell<Option<Cam>> = const { std::cell::Cell::new(None) };
     // A sample of the ground layer's tile art, kept from frame to frame. See
     // the tileset-swap check below for why it exists.
     static ART_SNAP: std::cell::RefCell<(usize, Vec<u32>, u8)> =
         const { std::cell::RefCell::new((usize::MAX, Vec::new(), 0)) };
+}
+
+/// A restored save state starts a new timeline. Neither scroll integration
+/// nor tileset-change detection can reuse observations from the old one.
+pub fn reset_history() {
+    CAM.with(|c| c.set(None));
+    ART_SNAP.with(|s| *s.borrow_mut() = (usize::MAX, Vec::new(), 0));
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    #[test]
+    fn border_reads_only_its_declared_pattern_and_wraps_west_and_north() {
+        let mut rom = [0u8; 0x28];
+        rom[8..12].copy_from_slice(&0x0800_0020u32.to_le_bytes());
+        rom[0x18] = 2;
+        rom[0x19] = 2;
+        for (i, tile) in [0x14u16, 0x17, 0x1C, 0x1F].into_iter().enumerate() {
+            rom[0x20 + i * 2..0x22 + i * 2].copy_from_slice(&tile.to_le_bytes());
+        }
+        let read = |a: u32| rom.get(a.checked_sub(0x0800_0000)? as usize).copied();
+        let border = Border::read(0x0800_0000, &read).unwrap();
+        assert_eq!(border.tiles.len(), 4);
+        for y in -9..9 {
+            for x in -9..9 {
+                let expected = match (x & 1, y & 1) {
+                    (0, 0) => 0x0C14,
+                    (1, 0) => 0x0C17,
+                    (0, 1) => 0x0C1C,
+                    _ => 0x0C1F,
+                };
+                assert_eq!(border.at(x, y), Some(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn border_supports_rectangular_patterns_and_undefined_tiles() {
+        let border = Border {
+            width: 3,
+            height: 2,
+            tiles: vec![1, 2, 3, 4, 5, 0x3FF],
+        };
+        assert_eq!(border.at(-3, -1), Some(0x0C04));
+        assert_eq!(border.at(4, 2), Some(0x0C02));
+        assert_eq!(border.at(-1, -1), None);
+    }
+
+    #[test]
+    fn border_rejects_zero_dimensions_and_truncated_rom() {
+        assert!(Border::read(0x0800_0000, &|_| Some(0)).is_none());
+        assert!(Border::read(u32::MAX, &|_| Some(2)).is_none());
+        assert!(
+            Border::read(0x0800_0000, &|a| match a {
+                0x0800_0018 | 0x0800_0019 => Some(2),
+                0x0800_0008..=0x0800_000A => Some(0),
+                0x0800_000B => Some(8),
+                _ => None,
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn restoring_a_state_discards_camera_and_pending_scene_transition() {
+        CAM.with(|c| {
+            c.set(Some(Cam {
+                hofs: 255,
+                vofs: 128,
+                x: 511,
+                y: 384,
+                map: 0x0203_1DFC,
+            }))
+        });
+        ART_SNAP.with(|s| *s.borrow_mut() = (0, vec![123; 2048], 4));
+        reset_history();
+        CAM.with(|c| assert!(c.get().is_none()));
+        ART_SNAP.with(|s| {
+            let s = s.borrow();
+            assert_eq!(s.0, usize::MAX);
+            assert!(s.1.is_empty());
+            assert_eq!(s.2, 0);
+        });
+    }
 }
 
 /// Southern rows of a built volume that stand up as its front (GBA_3D_WALL,
@@ -700,7 +841,7 @@ impl MapGrid {
         if dbg {
             eprintln!("grid: map {mapw}x{maph} conn={conn:02X} indoors={indoors}");
         }
-        // FRLG border block: 4x4 metatiles the game tiles past every
+        // FRLG border block: map-sized pattern the game tiles past every
         // unconnected edge. Outdoors that is real scenery, the tree line that
         // keeps Pallet Town from ending in a void, and it belongs in the
         // diorama. Indoors it is whatever the layout happened to leave there,
@@ -708,17 +849,7 @@ impl MapGrid {
         // it: the Viridian Pokemon Center's is a slice of the front counter,
         // which tiled out into a wall of counters on all four sides of the
         // room. Outside a room there is nothing to draw.
-        let border = (!indoors)
-            .then(|| rd32(layout + 8))
-            .flatten()
-            .filter(|&p| p >> 24 == 8 || p >> 24 == 9)
-            .map(|border_ptr| {
-                let mut b = [0u16; 16];
-                for (i, e) in b.iter_mut().enumerate() {
-                    *e = rd16(border_ptr + i as u32 * 2).unwrap_or(0x3FF);
-                }
-                b
-            });
+        let border = (!indoors).then(|| Border::read(layout, &rd8)).flatten();
         // Live grid entry: metatile id 0-9, collision 10-11, elevation 12-15.
         // VMap coordinates are map coordinates + 7 (the border margin).
         let entry = |gx: i32, gy: i32| -> Option<u16> {
@@ -765,13 +896,8 @@ impl MapGrid {
             // Past the live grid or on an unconnected edge: tile the border
             // block. This is what the real game draws past the map boundary
             // (trees around Pallet Town, darkness around interiors).
-            if let Some(b) = border {
-                let bx = gx.rem_euclid(4) as usize;
-                let by = gy.rem_euclid(4) as usize;
-                let e = b[by * 4 + bx];
-                if e & 0x3FF != 0x3FF {
-                    return Some(e);
-                }
+            if let Some(b) = &border {
+                return b.at(gx, gy);
             }
             None
         };
@@ -1259,7 +1385,23 @@ impl MapGrid {
                         }
                     }
                     Kind::Thin => Cell::Bill,
-                    Kind::Struct => Self::structure(gx, gy, &kind, &entry),
+                    Kind::Struct => {
+                        let cell = Self::structure(gx, gy, &kind, &entry);
+                        match cell {
+                            // Outdoor buildings keep the roof in the first
+                            // structural row and the facade below it. Folding
+                            // only the last row put windows on the roof.
+                            Cell::Block { n, k, wall, .. } if !indoors && n >= 4 && wall > 0 => {
+                                Cell::Block {
+                                    h: 32.0,
+                                    n,
+                                    k,
+                                    wall: n - 1,
+                                }
+                            }
+                            _ => cell,
+                        }
+                    }
                     Kind::Open if is_water(e) => Cell::Water,
                     Kind::Open => match behavior(e) {
                         0x02 | 0x03 => Cell::Grass,
@@ -1348,6 +1490,72 @@ impl MapGrid {
                 height[i] = 0.0;
             }
         }
+        // A modeled tree must not keep its old canopy painted onto its floor.
+        // Choose the prevalent green walkable tile from the entire map, so
+        // forest ground stays the same as the camera moves or enters a margin.
+        let mut ground_counts = [0u32; 1024];
+        if models::enabled() && !indoors {
+            for y in (0..maph).step_by((maph / 64).max(1) as usize) {
+                for x in (0..mapw).step_by((mapw / 64).max(1) as usize) {
+                    if let Some(e) = entry(x, y)
+                        && e & 0x0C00 == 0
+                        && !is_water(e)
+                    {
+                        let s = slot_of(e);
+                        let c = art.borrow().flat[s];
+                        let (r, g, b) = (c >> 16 & 255, c >> 8 & 255, c & 255);
+                        if g * 10 > r * 11 && g > b && g > 24 {
+                            ground_counts[(e & 0x3FF) as usize] += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let model_floor = ground_counts
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, n)| n)
+            .filter(|&(_, &n)| n > 0)
+            .map(|(id, _)| slot_of(id as u16))
+            .unwrap_or(0);
+        let back_wall = indoors
+            && mapw >= 6
+            && (0..mapw).all(|x| (0..2).all(|y| solid(x, y) && !is_dark(x, y)));
+        let lab = indoors
+            && (mapw, maph) == (13, 14)
+            && [(8, 4, 0x2A8), (9, 4, 0x2A9), (10, 4, 0x2AA), (1, 8, 0x073)]
+                .iter()
+                .all(|&(x, y, id)| entry(x, y).is_some_and(|e| e & 0x3ff == id));
+        let mut interior = vec![interiors::Part::Ordinary; cells.len()];
+        if indoors {
+            for cy in 0..Self::ROWS as i32 {
+                for cx in 0..Self::COLS as i32 {
+                    let i = cy as usize * Self::COLS + cx as usize;
+                    if cells[i] == Cell::Void {
+                        continue;
+                    }
+                    interior[i] =
+                        interiors::classify(gx0 + cx, gy0 + cy, back_wall, lab, &|x, y| {
+                            entry(x, y).map(&behavior).unwrap_or(0)
+                        });
+                    let h = match interior[i] {
+                        interiors::Part::Shelf(1) => Some(20.0),
+                        interiors::Part::Table(0) | interiors::Part::Desk(1) => Some(8.0),
+                        interiors::Part::Wall(1) => Some(32.0),
+                        _ => None,
+                    };
+                    if let Some(h) = h {
+                        cells[i] = Cell::Block {
+                            h,
+                            n: 1,
+                            k: 0,
+                            wall: 0,
+                        };
+                        height[i] = h;
+                    }
+                }
+            }
+        }
         let art = art.into_inner();
         if std::env::var("GBA_3D_CELLS").is_ok() {
             let mut seen: Vec<u16> = Vec::new();
@@ -1395,6 +1603,12 @@ impl MapGrid {
             gy0,
             player: (px, py),
             mapsize: (mapw, maph),
+            indoors,
+            interior,
+            model_floor,
+            actors: cap
+                .map(|c| actors::read(bus, c, (camx, camy)))
+                .unwrap_or_default(),
             cells,
             slots,
             height,
@@ -1526,6 +1740,14 @@ impl MapGrid {
     pub fn ground_at_map(&self, mx: i32, my: i32) -> f32 {
         let cx = mx.div_euclid(16) - self.gx0;
         let cy = my.div_euclid(16) - self.gy0;
+        if self.indoors
+            && matches!(
+                self.interior_at(cx, cy),
+                interiors::Part::Table(0) | interiors::Part::Desk(1)
+            )
+        {
+            return 8.0;
+        }
         match self.at(cx, cy) {
             Cell::Water => WATER,
             _ => 0.0,
@@ -1535,10 +1757,9 @@ impl MapGrid {
     /// Map-pixel coordinate a GBA screen pixel looks at. Screen pixel (112, 80)
     /// is the camera, and the camera is `(gx0 + 7 + MX) * 16 + fine.0` in map
     /// pixels by construction of the window.
-    pub fn map_pixel(&self, px: usize, py: usize) -> (i32, i32) {
-        let camx = (self.gx0 + 7 + MX) * 16 + self.fine.0 as i32;
-        let camy = (self.gy0 + 5 + MY_N) * 16 + self.fine.1 as i32;
-        (camx + px as i32 - 112, camy + py as i32 - 80)
+    fn map_pixel_signed(&self, px: i32, py: i32) -> (i32, i32) {
+        let (camx, camy) = self.camera();
+        (camx + px - 112, camy + py - 80)
     }
 
     /// One line per window cell, keyed by MAP coordinate, for the harness's
@@ -1577,8 +1798,11 @@ impl MapGrid {
 pub struct Renderer {
     pub buffer: Vec<u32>,
     zbuf: Vec<f32>,
+    /// Frozen before characters draw, so a sprite cannot occlude itself.
+    scenery_depth: Vec<f32>,
     background: Vec<u32>,
-    /// Tilt-shift level 0-3 from GBA_TILT (default 2; 0 = off).
+    /// Tilt-shift level 0-3. Modeled scenery stays sharp by default; the
+    /// legacy miniature style defaults to level 2.
     tilt: u32,
     /// Last known state of the map-grid read, so the fallback logs once on
     /// each transition instead of every frame.
@@ -1593,17 +1817,9 @@ pub struct Renderer {
     /// Which tree unit painted each pixel (`NO_TREE` for everything else), and
     /// the exact colour it painted there.
     ///
-    /// TREES ARE THE ONE THING IN THE PICTURE THAT MUST STAY THE GAME'S OWN
-    /// ARTWORK. Every outdoor map is framed by them, they are the biggest
-    /// blocks of flat colour on screen, and the eye reads any drift in them as
-    /// the renderer being wrong rather than as a photographic effect. The
-    /// tilt-shift pass was doing both things it must not do to them: the
-    /// gaussian blur made neighbouring canopies bleed through one another (the
-    /// "you can see trees through trees" ghosting) and the saturation lift
-    /// moved every canopy pixel OFF the game's palette (the paleness). Both
-    /// are measured against the 2D render by `tools/treediff.py` and by the
-    /// `trees.pixelmatch` harness check, which is why the mask exists rather
-    /// than a global "turn the post-process down".
+    /// Protect tree materials in the central focus area from blur and color
+    /// shifts. In sprite mode these are the original art colors; modeled
+    /// trees record their lit material colors instead.
     tree_id: Vec<u16>,
     tree_paint: Vec<u32>,
     /// The tree unit currently being painted, or `NO_TREE`.
@@ -1619,11 +1835,12 @@ const NO_TREE: u16 = u16::MAX;
 /// How a textured pass treats pixels the depth buffer says are hidden.
 #[derive(Clone, Copy, PartialEq)]
 enum Ghost {
+    /// Recover the part of an NPC that should stand above furniture.
+    Restore,
     /// Normal opaque pass: draw what is in front, write depth.
     Off,
-    /// Repaint the hidden part of the figure in full colour, over whatever
-    /// hides him. What a character walking behind a building gets.
-    Solid,
+    /// Tint the hidden player's shape so it reads as a marker behind scenery.
+    Marker,
     /// Repaint it as a faint silhouette. What a character behind a fence or a
     /// tree gets.
     Faint,
@@ -1647,11 +1864,12 @@ impl Renderer {
         Self {
             buffer: background.clone(),
             zbuf: vec![f32::INFINITY; WIDTH * HEIGHT],
+            scenery_depth: vec![f32::INFINITY; WIDTH * HEIGHT],
             background,
             tilt: std::env::var("GBA_TILT")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(2)
+                .unwrap_or(if models::enabled() { 0 } else { 2 })
                 .min(3),
             grid_ok: true,
             no_walls: std::env::var("GBA_NO_WALLS").is_ok(),
@@ -1678,6 +1896,7 @@ impl Renderer {
         let min_y = (p[0].1.min(p[1].1).min(p[2].1).floor().max(0.0)) as usize;
         let max_y = (p[0].1.max(p[1].1).max(p[2].1).ceil()).min(HEIGHT as f32 - 1.0) as usize;
         let inv = 1.0 / area;
+        let iz = p.map(|v| 1.0 / v.2);
         for y in min_y..=max_y {
             let fy = y as f32 + 0.5;
             for x in min_x..=max_x {
@@ -1688,7 +1907,7 @@ impl Renderer {
                 if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
                     continue;
                 }
-                let z = w0 * p[0].2 + w1 * p[1].2 + w2 * p[2].2;
+                let z = 1.0 / (w0 * iz[0] + w1 * iz[1] + w2 * iz[2]);
                 let i = y * WIDTH + x;
                 if z < self.zbuf[i] {
                     match dim {
@@ -1709,8 +1928,10 @@ impl Renderer {
         }
     }
 
-    /// Z-buffered textured triangle: uv interpolated barycentrically,
-    /// color from `sample(u, v)`.
+    /// Perspective-correct texture and depth interpolation. Linear screen
+    /// interpolation bends roof shingles across a quad's diagonal and makes
+    /// sloped surfaces disagree about depth. Interpolate u/z, v/z and 1/z.
+    /// Color comes from `sample(u, v)`.
     fn tri_uv(
         &mut self,
         p: [(f32, f32, f32); 3],
@@ -1745,6 +1966,7 @@ impl Renderer {
         let min_y = (p[0].1.min(p[1].1).min(p[2].1).floor().max(0.0)) as usize;
         let max_y = (p[0].1.max(p[1].1).max(p[2].1).ceil()).min(HEIGHT as f32 - 1.0) as usize;
         let inv = 1.0 / area;
+        let iz = p.map(|v| 1.0 / v.2);
         for y in min_y..=max_y {
             let fy = y as f32 + 0.5;
             for x in min_x..=max_x {
@@ -1758,19 +1980,23 @@ impl Renderer {
                 if w0 < E || w1 < E || w2 < E {
                     continue;
                 }
-                let z = w0 * p[0].2 + w1 * p[1].2 + w2 * p[2].2;
+                let z = 1.0 / (w0 * iz[0] + w1 * iz[1] + w2 * iz[2]);
                 let i = y * WIDTH + x;
                 if self.counting {
                     // Coverage has to be measured before the depth test, so
                     // this variant samples first. Only sprites use it; the
                     // world pass keeps its early depth reject.
-                    let u = w0 * uv[0].0 + w1 * uv[1].0 + w2 * uv[2].0;
-                    let v = w0 * uv[0].1 + w1 * uv[1].1 + w2 * uv[2].1;
+                    let u =
+                        (w0 * uv[0].0 * iz[0] + w1 * uv[1].0 * iz[1] + w2 * uv[2].0 * iz[2]) * z;
+                    let v =
+                        (w0 * uv[0].1 * iz[0] + w1 * uv[1].1 * iz[1] + w2 * uv[2].1 * iz[2]) * z;
                     let c = sample(u, v);
                     if c != SKIP {
                         self.cov += 1;
-                        if z < self.zbuf[i] {
+                        if z <= self.scenery_depth[i] + 0.01 {
                             self.vis += 1;
+                        }
+                        if z < self.zbuf[i] {
                             self.zbuf[i] = z;
                             self.buffer[i] = c;
                             self.tree_id[i] = NO_TREE;
@@ -1778,33 +2004,36 @@ impl Renderer {
                     }
                     continue;
                 }
-                if (z < self.zbuf[i]) == (ghost == Ghost::Off) {
-                    let u = w0 * uv[0].0 + w1 * uv[1].0 + w2 * uv[2].0;
-                    let v = w0 * uv[0].1 + w1 * uv[1].1 + w2 * uv[2].1;
+                let passes = if ghost == Ghost::Off {
+                    z < self.zbuf[i]
+                } else {
+                    z > self.scenery_depth[i] + 0.01 && self.zbuf[i] >= self.scenery_depth[i] - 0.01
+                };
+                if passes {
+                    let u =
+                        (w0 * uv[0].0 * iz[0] + w1 * uv[1].0 * iz[1] + w2 * uv[2].0 * iz[2]) * z;
+                    let v =
+                        (w0 * uv[0].1 * iz[0] + w1 * uv[1].1 * iz[1] + w2 * uv[2].1 * iz[2]) * z;
                     let c = sample(u, v);
                     if c != SKIP {
                         match ghost {
-                            // BEHIND A BUILDING HE IS SIMPLY IN FRONT OF IT.
-                            //
-                            // Hollowed-out glass reads as the character
-                            // dissolving, and against a roof that is exactly
-                            // what "he sinks into the house" looks like. Every
-                            // handheld Pokemon game that draws a diorama solves
-                            // this the blunt way: a character standing on a
-                            // walkable row behind a building is drawn WHOLE,
-                            // in full colour, over the roof. There is no
-                            // ambiguity to read past.
-                            Ghost::Solid => self.buffer[i] = c,
-                            // Anything else in front of him -- a fence, a
-                            // signpost, the corner of a tree -- is small, and a
-                            // faint silhouette through it is right: he must not
-                            // look like he is standing SOUTH of the fence.
+                            // A hidden player's shape is an explicit x-ray marker,
+                            // never the full-color sprite painted on the roof.
+                            Ghost::Marker => {
+                                let mix = |shift: u32| {
+                                    let scene = (self.buffer[i] >> shift) & 255;
+                                    let marker = (0xB7D9EBu32 >> shift) & 255;
+                                    ((scene * 3 + marker * 2) / 5) << shift
+                                };
+                                self.buffer[i] = mix(16) | mix(8) | mix(0);
+                            }
                             Ghost::Faint => {
                                 let mix = |s: u32, a: u32| {
                                     (((a >> s & 0xFF) * 3 + (self.buffer[i] >> s & 0xFF)) / 4) << s
                                 };
                                 self.buffer[i] = mix(16, c) | mix(8, c) | mix(0, c);
                             }
+                            Ghost::Restore => self.buffer[i] = c,
                             Ghost::Off => {
                                 self.zbuf[i] = z;
                                 self.buffer[i] = c;
@@ -1922,12 +2151,8 @@ impl Renderer {
         }
     }
 
-    /// One line per tree unit on screen: how many pixels its billboard won,
-    /// and how many of them the FINISHED frame no longer shows in the colour
-    /// the game's own artwork put there. The second number is the whole
-    /// question -- a tree that survives every later pass untouched is, pixel
-    /// for pixel, the 2D render's tree -- and `trees.pixelmatch` requires it
-    /// to be zero.
+    /// Report how many pixels each tree painted and how many were changed by
+    /// post-processing. Modeled trees use lit materials, not 2D palette parity.
     fn trace_trees(&self) {
         let mut painted = vec![0u32; self.tree_at.len()];
         let mut off = vec![0u32; self.tree_at.len()];
@@ -1966,6 +2191,12 @@ impl Renderer {
                 if cell == Cell::Void {
                     continue;
                 }
+                if g.indoors && self.render_interior_cell(g, cx, cy) {
+                    continue;
+                }
+                if models::enabled() && self.render_building_cell(g, cx, cy) {
+                    continue;
+                }
                 let (x0, x1) = (g.ox + cx as f32 * STEP, g.ox + (cx + 1) as f32 * STEP);
                 let (zn, zs) = (g.oz - cy as f32 * STEP, g.oz - (cy + 1) as f32 * STEP);
                 let h = g.height[i];
@@ -1984,6 +2215,13 @@ impl Renderer {
                 // so there are no 16-pixel slices to leave shelf lines and no
                 // half canopies at the window edge.
                 if let Cell::Tree { w, h, dx, dy } = cell {
+                    if models::enabled() && !g.indoors {
+                        self.render_tree_floor(g, cx, cy, [w, h, dx, dy]);
+                        if dx == 0 && dy == 0 {
+                            self.render_tree_model(g, cx, cy, w, h);
+                        }
+                        continue;
+                    }
                     // The floor under every cell of the unit is the grass next
                     // door in shadow. Painting the tree's own metatile flat is
                     // what put a pale green shelf under each canopy.
@@ -2125,7 +2363,13 @@ impl Renderer {
                     project(x0, h, zs),
                 ];
                 self.quad_uv(top, &mut |u, v| {
-                    let gv = (k as f32 + v.clamp(0.0, 0.999)) * roof as f32 / n as f32;
+                    let gv = if !g.indoors && n >= 4 && roof == 1 {
+                        // Repeat the original roof strip at its native scale.
+                        // Stretching one tile over a house magnified its seams.
+                        v.clamp(0.0, 0.999)
+                    } else {
+                        (k as f32 + v.clamp(0.0, 0.999)) * roof as f32 / n as f32
+                    };
                     let sc = (gv as i32).min(roof - 1);
                     let src = g.slot_at(cx, cy - k + sc, slot);
                     g.art.comp_at(
@@ -2204,14 +2448,17 @@ impl Renderer {
         }
     }
 
-    /// Sprites: group captured sprite pixels into connected figures, then draw
+    /// Sprites: group complete actor pixels and captured effects, then draw
     /// each as ONE flat alpha-cut quad standing at its feet and leaning back
     /// by exactly the camera pitch, with a soft contact shadow. A sprite is a
     /// drawing, not an object seen from one side; no geometry is built from
     /// its pixels.
     fn render_sprites(&mut self, cap: &Capture, mgrid: &MapGrid) {
-        const W: usize = ppu::WIDTH;
-        let mut grid: Vec<u32> = vec![0; W * ppu::HEIGHT];
+        self.scenery_depth.copy_from_slice(&self.zbuf);
+        const PAD: i32 = 96;
+        const W: usize = ppu::WIDTH + 192;
+        const H: usize = ppu::HEIGHT + 192;
+        let mut grid: Vec<u32> = vec![0; W * H];
         // Group sprite pixels by the OAM object that drew them. Grouping by
         // "pixels that touch each other" used to fuse the player with an NPC
         // standing right beside him into ONE figure: the pair got a single
@@ -2219,9 +2466,12 @@ impl Renderer {
         // lifted, and drew in front of him) under one merged blob of shadow.
         let mut group = vec![usize::MAX; 256];
         let mut boxes: Vec<[i32; 4]> = Vec::new(); // minx, maxx, miny, maxy
-        let mut owner: Vec<u16> = vec![u16::MAX; W * ppu::HEIGHT];
-        for &(px, py, color, obj) in &cap.sprite_pixels {
-            let (x, y) = (px as i32, py as i32);
+        let mut owner: Vec<u16> = vec![u16::MAX; W * H];
+        for &(px, py, color, obj) in &mgrid.actors.pixels {
+            let (x, y) = (px + PAD, py + PAD);
+            if x < 0 || y < 0 || x >= W as i32 || y >= H as i32 {
+                continue;
+            }
             let g = match group[obj as usize] {
                 usize::MAX => {
                     group[obj as usize] = boxes.len();
@@ -2237,8 +2487,8 @@ impl Renderer {
                     g
                 }
             };
-            grid[py as usize * W + px as usize] = color | 0xFF00_0000;
-            owner[py as usize * W + px as usize] = g as u16;
+            grid[y as usize * W + x as usize] = color | 0xFF00_0000;
+            owner[y as usize * W + x as usize] = g as u16;
         }
         // One figure CAN be several OAM objects (a big sprite split in two).
         // Merge groups that overlap on screen and stand on the same row; two
@@ -2274,8 +2524,8 @@ impl Renderer {
         // touch at all.
         let foot_cell = |b: [i32; 4]| {
             let cx = ((b[0] + b[1]) / 2).clamp(0, W as i32 - 1) as usize;
-            let cy = b[3].clamp(0, ppu::HEIGHT as i32 - 1) as usize;
-            let (mx, my) = mgrid.map_pixel(cx, cy);
+            let cy = b[3].clamp(0, H as i32 - 1) as usize;
+            let (mx, my) = mgrid.map_pixel_signed(cx as i32 - PAD, cy as i32 - PAD);
             mgrid.cell_at_map(mx, my)
         };
         for a in 0..boxes.len() {
@@ -2340,9 +2590,9 @@ impl Renderer {
             if pixels.is_empty() {
                 continue;
             }
-            let feet = pixels.iter().map(|i| i / W).max().unwrap() as f32 + 1.0;
-            let min_x = pixels.iter().map(|i| i % W).min().unwrap() as f32;
-            let max_x = pixels.iter().map(|i| i % W).max().unwrap() as f32 + 1.0;
+            let feet = pixels.iter().map(|i| i / W).max().unwrap() as f32 + 1.0 - PAD as f32;
+            let min_x = pixels.iter().map(|i| i % W).min().unwrap() as f32 - PAD as f32;
+            let max_x = pixels.iter().map(|i| i % W).max().unwrap() as f32 + 1.0 - PAD as f32;
             let ccx = (min_x + max_x) / 2.0;
             let (dx, dy) = ((ccx - 120.0).abs(), (feet - 88.0).abs());
             if dx < 24.0 && dy < 24.0 {
@@ -2353,16 +2603,23 @@ impl Renderer {
             }
         }
         let player_fig = best_player.map(|(_, f)| f);
+        let mut actor_anchors = vec![None; boxes.len()];
+        for (id, anchor) in mgrid.actors.anchors.iter().enumerate() {
+            let g = group[128 + id];
+            if g != usize::MAX {
+                actor_anchors[root(&mut find, g)] = *anchor;
+            }
+        }
 
         for (fig, pixels) in figures.iter().enumerate() {
             if pixels.is_empty() {
                 continue;
             }
             // Figure extents: feet = lowest pixel row.
-            let mut feet = pixels.iter().map(|i| i / W).max().unwrap() as f32 + 1.0;
-            let mut min_x = pixels.iter().map(|i| i % W).min().unwrap() as f32;
-            let mut max_x = pixels.iter().map(|i| i % W).max().unwrap() as f32 + 1.0;
-            let mut top = pixels.iter().map(|i| i / W).min().unwrap() as f32;
+            let mut feet = pixels.iter().map(|i| i / W).max().unwrap() as f32 + 1.0 - PAD as f32;
+            let mut min_x = pixels.iter().map(|i| i % W).min().unwrap() as f32 - PAD as f32;
+            let mut max_x = pixels.iter().map(|i| i % W).max().unwrap() as f32 + 1.0 - PAD as f32;
+            let mut top = pixels.iter().map(|i| i / W).min().unwrap() as f32 - PAD as f32;
             // A FIGURE HALF OFF THE SCREEN IS STILL STANDING SOMEWHERE.
             //
             // Every extent above is the extent of what the PPU DREW, so an
@@ -2384,7 +2641,7 @@ impl Renderer {
                 } else {
                     0.0
                 };
-                let padr = if max_x < W as f32 {
+                let padr = if max_x < ppu::WIDTH as f32 {
                     b[2] as f32 - max_x
                 } else {
                     0.0
@@ -2392,7 +2649,7 @@ impl Renderer {
                 if min_x <= 0.0 {
                     min_x = b[0] as f32 + padr;
                 }
-                if max_x >= W as f32 {
+                if max_x >= ppu::WIDTH as f32 {
                     max_x = b[2] as f32 - padl;
                 }
                 // A SLIVER IS NOT A MEASUREMENT.
@@ -2406,7 +2663,7 @@ impl Renderer {
                 // flat on the ground. So a figure clipped on either side takes
                 // its whole vertical extent from OAM as well, exactly as one
                 // clipped at the top or the bottom already did.
-                let sliver = min_x <= 0.0 || max_x >= W as f32;
+                let sliver = min_x <= 0.0 || max_x >= ppu::WIDTH as f32;
                 if feet >= ppu::HEIGHT as f32 || sliver {
                     feet = b[3] as f32 - VPAD;
                 }
@@ -2434,9 +2691,10 @@ impl Renderer {
             // rounded to whole cells, which is immune to a few pixels of
             // animation; for the player that offset is zero on every frame of
             // a walk, a bump and a turn alike.
-            let fx = ((min_x + max_x) as usize / 2).min(W - 1);
+            let fx = ((min_x + max_x) / 2.0) as i32;
             let (camx, camy) = mgrid.camera();
-            let measured = mgrid.map_pixel(fx, feet as usize);
+            let (fx, fy) = actor_anchors[fig].unwrap_or((fx, feet as i32));
+            let measured = mgrid.map_pixel_signed(fx, fy);
             let player = player_fig == Some(fig);
             let (ax, ay) = if player {
                 // Whole cells only, and with a deadband: a character's drawn
@@ -2571,7 +2829,9 @@ impl Renderer {
                 // past the frame edge where the PPU drew nothing. Those samples
                 // are transparent; clamping them back inside repeated the one
                 // drawn row down the whole quad (the edge-of-screen smear).
-                if sxf < 0.0 || syf < 0.0 || sxf >= W as f32 || syf >= ppu::HEIGHT as f32 {
+                let sxf = sxf + PAD as f32;
+                let syf = syf + PAD as f32;
+                if sxf < 0.0 || syf < 0.0 || sxf >= W as f32 || syf >= H as f32 {
                     return SKIP;
                 }
                 let i = syf as usize * W + sxf as usize;
@@ -2589,64 +2849,10 @@ impl Renderer {
             self.vis = 0;
             self.quad_uv(q, &mut sampler);
             self.counting = false;
-            // Repaint the figure closest to screen center (the player) as a
-            // translucent silhouette wherever scenery hides it, so walking
-            // behind a house or tree never loses the character. Only when
-            // scenery really swallows him, though: painting him through a
-            // fence that crosses his shins put him visibly in front of it,
-            // which is exactly the "he looks like he is south of the fence"
-            // report.
-            //
-            // A LIFTED ROOF IS NOT A FENCE, THOUGH, AND HALF-HIDDEN IS THE
-            // WORST CASE. Standing a building two steps off the ground moves
-            // its whole picture about forty screen pixels north, so it covers
-            // the walkable rows BEHIND it -- and a figure walking along those
-            // rows was cut off from the feet up, a little more with every step,
-            // which reads as walking down a staircase. It is not a depth bug:
-            // the roof really is nearer the camera than a figure one row north
-            // of it, because lifting a quad by h also brings it h * sin(pitch)
-            // closer. The diorama's answer to "hidden by scenery" is the
-            // silhouette, so it just has to trigger, and half of him has to
-            // vanish first only when the thing in front of him is waist high.
-            // When the map says a built volume stands on the rows between him
-            // and the camera, any occlusion at all is that volume, and the
-            // silhouette comes up immediately.
-            // IS A BUILDING STANDING BETWEEN HIM AND THE CAMERA?
-            //
-            // The probe used to read the single column of cells under his
-            // anchor, and that column is a whole cell behind the picture for
-            // the sixteen frames of a step: FireRed moves the sprite across
-            // the gap first and the anchor follows the camera. So walking east
-            // along the row behind his house, the roof started swallowing him
-            // from the feet up while the map still said "nothing in front of
-            // you", and no silhouette came -- the sinking, exactly as
-            // reported, and it happened on the FIRST step onto every building.
-            //
-            // He is as wide as his cell, so the probe is as wide as he is:
-            // the cell under each of his shoulders as well as under his feet.
-            //
-            // AND IT IS ASKED FROM BOTH OF THE TWO PLACES HE IS AT ONCE.
-            //
-            // The anchor rides the camera, which is continuous and matches his
-            // pixels, but only reaches the cell he is walking into when the
-            // step FINISHES; gSaveBlock1Ptr names that cell on the step's first
-            // frame and holds it. So during the sixteen frames of a step the
-            // two disagree, and asking either one alone is wrong for part of
-            // every step: the camera cell is a step behind when he walks into a
-            // building's shadow (the roof is already clipping his feet while
-            // the probe still says the way is clear -- measured at up to eighty
-            // clipped pixels for four frames before the cutout came up, the
-            // "he is on the roof for a frame or two" report), and the game cell
-            // is a step ahead when he walks out of it (the roof still covers
-            // him while the probe already says he is clear).
-            //
-            // Either cell naming a volume is enough. The cutout then comes up
-            // on the first frame anything can occlude him and stays up until
-            // both agree he is past it, and since it only ever repaints pixels
-            // that something really is covering, holding it a frame longer than
-            // needed changes nothing on screen.
-            // The probe answers with HOW TALL the thing in front of him is,
-            // because that is what decides how much of him it can really hide.
+            // Raised scenery can hide the walkable row behind it. Probe both
+            // the interpolated anchor and the game's destination cell, across
+            // the character's width, so the marker starts on the first hidden
+            // frame and stays until the character has cleared the building.
             let probe = |cx: i32, cy: i32| -> Option<f32> {
                 let mut tall: Option<f32> = None;
                 for d in 1..=3 {
@@ -2660,20 +2866,8 @@ impl Renderer {
                 }
                 tall
             };
-            // EVERY character gets the cutout, not just the player. The
-            // second probe is the player's own game cell, so it only means
-            // anything for him, but the volume test itself has to run for
-            // NPCs too: the man sitting by the mirror in a Pokemon Center
-            // stands one row behind a table, the table is a volume 16 tall,
-            // and lifting it carried it over him. All that was left of him
-            // was the top of his head, which is the "he disappears into the
-            // furniture" report. FireRed itself never lets scenery cover a
-            // character, so drawing him over the volume is also the more
-            // faithful answer.
-            //
-            // The FAINT silhouette stays the player's alone. It fires on
-            // ordinary half-cover, and every NPC standing in tall grass or
-            // behind a sign would start ghosting through it.
+            // The player gets a distinct x-ray marker. NPCs behind furniture
+            // recover only the portion that stands above its height.
             let front = probe(ax, ay - 8).or_else(|| {
                 player
                     .then(|| probe(mgrid.player.0 * 16 + 8, mgrid.player.1 * 16 + 8))
@@ -2689,25 +2883,8 @@ impl Renderer {
                 player && center_dist < 40.0 && hidden * 2 > self.cov
             };
             if ghost {
-                // Behind a building he is drawn whole and in full colour over
-                // the roof; behind anything smaller a faint silhouette is
-                // enough and keeps him from reading as standing in front of a
-                // fence he is really behind.
-                // HOW MUCH OF HIM COMES BACK.
-                //
-                // The player comes back whole: he is the one the camera is
-                // for, and a character who half-vanishes behind his own house
-                // is the sinking this cutout exists to stop.
-                //
-                // Anyone else comes back only as far down as the thing in
-                // front of him reaches. A table sixteen units high standing
-                // before a man thirty-two units tall covers his legs and
-                // nothing more, so his legs stay covered and he reads as
-                // standing BEHIND the table. Repainting all of him instead put
-                // him on top of it, standing on the furniture. The same sum
-                // leaves a character behind a real wall hidden, because a wall
-                // as tall as he is cuts away everything there was to bring
-                // back, which is what should happen.
+                // Keep the hidden player locatable with a tinted silhouette.
+                // Furniture recovery for NPCs remains limited to their upper body.
                 let cut = match front {
                     Some(h) if !player => 1.0 - (h / hart.max(1.0)).clamp(0.0, 1.0),
                     _ => 1.0,
@@ -2715,8 +2892,10 @@ impl Renderer {
                 self.quad_uv_ghost(
                     q,
                     &mut |u, v| if v < cut { sampler(u, v) } else { SKIP },
-                    if behind_volume {
-                        Ghost::Solid
+                    if behind_volume && player {
+                        Ghost::Marker
+                    } else if behind_volume {
+                        Ghost::Restore
                     } else {
                         Ghost::Faint
                     },
@@ -2902,5 +3081,133 @@ impl Renderer {
 impl Default for Renderer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod occlusion_tests {
+    use super::*;
+    /// Exercise the shared rasterizer independently of map-specific geometry.
+    /// The reference sprite provides both its alpha mask and interpolated depth.
+    #[test]
+    fn silhouette_mask_across_depths_screen_edges_and_transparent_pixels() {
+        let mut cases = 0;
+        for (x, y) in [
+            (100.0, 100.0),
+            (-12.0, 100.0),
+            (790.0, 100.0),
+            (100.0, -12.0),
+            (100.0, 490.0),
+            (-80.0, -80.0),
+        ] {
+            for depth in [8.0, 80.0, 800.0] {
+                let q = [
+                    (x, y, depth),
+                    (x + 32.0, y, depth * 1.2),
+                    (x + 32.0, y + 48.0, depth * 1.2),
+                    (x, y + 48.0, depth),
+                ];
+                let sample = |u: f32, v: f32| {
+                    if (u - 0.5).abs() < 0.12 || (v - 0.5).abs() < 0.08 {
+                        SKIP
+                    } else {
+                        0xff0000
+                    }
+                };
+                let mut reference = Renderer::new();
+                reference.quad_uv(q, &mut sample.clone());
+                for cover in 0..5 {
+                    for mode in [Ghost::Marker, Ghost::Faint, Ghost::Restore] {
+                        let mut r = Renderer::new();
+                        r.buffer.fill(0x333333);
+                        for i in 0..r.zbuf.len() {
+                            let selected = match cover {
+                                0 => false,
+                                1 => i % WIDTH < (x + 16.0).max(0.0) as usize,
+                                2 => i / WIDTH < (y + 24.0).max(0.0) as usize,
+                                3 => (i % WIDTH + i / WIDTH).is_multiple_of(3),
+                                _ => true,
+                            };
+                            if selected {
+                                r.zbuf[i] = depth * 0.5;
+                            }
+                        }
+                        r.scenery_depth.copy_from_slice(&r.zbuf);
+                        // Interleave foreground actors with scenery coverage.
+                        for i in (0..r.zbuf.len()).step_by(7) {
+                            r.zbuf[i] = depth * 0.25;
+                            r.buffer[i] = 0x00ff00;
+                        }
+                        r.counting = true;
+                        r.quad_uv(q, &mut sample.clone());
+                        r.counting = false;
+                        assert!(r.vis <= r.cov);
+                        if cover == 0 {
+                            assert_eq!(r.vis, r.cov);
+                        }
+                        let before = r.buffer.clone();
+                        let depth_before = r.zbuf.clone();
+                        r.quad_uv_ghost(q, &mut sample.clone(), mode);
+                        for (i, &old) in before.iter().enumerate() {
+                            let covered = reference.zbuf[i].is_finite()
+                                && reference.zbuf[i] > r.scenery_depth[i] + 0.01
+                                && i % 7 != 0;
+                            assert_eq!(
+                                r.buffer[i] != old,
+                                covered,
+                                "case {cases}, pixel {i}, cover {cover}"
+                            );
+                        }
+                        assert_eq!(r.zbuf, depth_before, "marker changed depth");
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 270);
+    }
+
+    const QUAD: [(f32, f32, f32); 4] = [
+        (10.0, 10.0, 10.0),
+        (30.0, 10.0, 10.0),
+        (30.0, 30.0, 10.0),
+        (10.0, 30.0, 10.0),
+    ];
+
+    #[test]
+    fn visible_sprite_and_its_shared_triangle_edge_never_hide_themselves() {
+        let mut r = Renderer::new();
+        r.scenery_depth.copy_from_slice(&r.zbuf);
+        r.counting = true;
+        r.quad_uv(QUAD, &mut |_, _| 0xff0000);
+        r.counting = false;
+        assert!(r.cov > 0);
+        assert_eq!(r.cov, r.vis);
+        let before = r.buffer.clone();
+        r.quad_uv_ghost(QUAD, &mut |_, _| 0xff0000, Ghost::Marker);
+        assert_eq!(r.buffer, before);
+    }
+
+    #[test]
+    fn marker_only_tints_scenery_covering_the_sprite_and_preserves_foreground_characters() {
+        let mut r = Renderer::new();
+        r.buffer.fill(0x333333);
+        for y in 10..30 {
+            for x in 10..20 {
+                r.zbuf[y * WIDTH + x] = 5.0;
+            }
+        }
+        r.scenery_depth.copy_from_slice(&r.zbuf);
+        let foreground = 15 * WIDTH + 12;
+        r.zbuf[foreground] = 2.0;
+        r.buffer[foreground] = 0x00ff00;
+        r.counting = true;
+        r.quad_uv(QUAD, &mut |_, _| 0xff0000);
+        r.counting = false;
+        assert!(r.vis > 0 && r.vis < r.cov);
+        r.quad_uv_ghost(QUAD, &mut |_, _| 0xff0000, Ghost::Marker);
+        assert_ne!(r.buffer[15 * WIDTH + 15], 0x333333);
+        assert_eq!(r.buffer[15 * WIDTH + 25], 0xff0000);
+        assert_eq!(r.buffer[foreground], 0x00ff00);
     }
 }

@@ -103,6 +103,7 @@ fn main() -> ExitCode {
             .unwrap_or(300);
         let script = parse_input_script();
         let mut n = 0;
+        let mut rendered_frame = None;
         let dump_every: Option<u32> = env::var("GBA_DUMP_EVERY").ok().and_then(|v| v.parse().ok());
         let dump_dir = env::var("GBA_DUMP_DIR").unwrap_or_else(|_| "filmstrip".into());
         // GBA_DUMP_FROM=N: skip the boot/menu frames, so a long scripted run
@@ -166,6 +167,7 @@ fn main() -> ExitCode {
                     cap.run(&cpu.bus.io, &cpu.bus.palette, &cpu.bus.vram, &cpu.bus.oam);
                     let g = voxel::MapGrid::read(&cpu.bus, Some(cap));
                     dio.render(cap, &cpu.bus.ppu.framebuffer, g.as_ref());
+                    rendered_frame = Some(n);
                     if let Some(g) = &g
                         && env::var("GBA_3D_GEOM").is_ok()
                     {
@@ -181,12 +183,15 @@ fn main() -> ExitCode {
                     let _ = std::fs::create_dir_all(&dump_dir);
                     match (&mut capture, &mut diorama) {
                         (Some(cap), Some(dio)) => {
-                            cap.run(&cpu.bus.io, &cpu.bus.palette, &cpu.bus.vram, &cpu.bus.oam);
-                            dio.render(
-                                cap,
-                                &cpu.bus.ppu.framebuffer,
-                                voxel::MapGrid::read(&cpu.bus, Some(cap)).as_ref(),
-                            );
+                            if rendered_frame != Some(n) {
+                                cap.run(&cpu.bus.io, &cpu.bus.palette, &cpu.bus.vram, &cpu.bus.oam);
+                                dio.render(
+                                    cap,
+                                    &cpu.bus.ppu.framebuffer,
+                                    voxel::MapGrid::read(&cpu.bus, Some(cap)).as_ref(),
+                                );
+                                rendered_frame = Some(n);
+                            }
                             dump_frame(
                                 &dio.buffer,
                                 voxel::WIDTH,
@@ -220,12 +225,14 @@ fn main() -> ExitCode {
         }
         match (&mut capture, &mut diorama) {
             (Some(cap), Some(dio)) => {
-                cap.run(&cpu.bus.io, &cpu.bus.palette, &cpu.bus.vram, &cpu.bus.oam);
-                dio.render(
-                    cap,
-                    &cpu.bus.ppu.framebuffer,
-                    voxel::MapGrid::read(&cpu.bus, Some(cap)).as_ref(),
-                );
+                if rendered_frame != Some(n) {
+                    cap.run(&cpu.bus.io, &cpu.bus.palette, &cpu.bus.vram, &cpu.bus.oam);
+                    dio.render(
+                        cap,
+                        &cpu.bus.ppu.framebuffer,
+                        voxel::MapGrid::read(&cpu.bus, Some(cap)).as_ref(),
+                    );
+                }
                 dump_frame(&dio.buffer, voxel::WIDTH, voxel::HEIGHT, "frame.ppm");
                 // GBA_BENCH: time capture + diorama render on the final frame.
                 if env::var("GBA_BENCH").is_ok() {
@@ -481,6 +488,8 @@ fn main() -> ExitCode {
                 }) {
                 Ok((loaded, _)) => {
                     cpu = loaded;
+                    voxel::reset_history();
+                    audio_queue.lock().unwrap().clear();
                     eprintln!("state loaded");
                 }
                 Err(e) => eprintln!("load state failed: {e}"),
