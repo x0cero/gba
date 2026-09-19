@@ -28,7 +28,7 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install ALSA and X11 headers (cpal and minifb build dependencies)
         if: matrix.os == 'ubuntu-latest'

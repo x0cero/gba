@@ -15,7 +15,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install ALSA and X11 headers (cpal and minifb build dependencies)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev libwayland-cursor0 libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev
       - uses: Swatinem/rust-cache@v2
