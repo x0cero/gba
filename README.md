@@ -4,7 +4,7 @@
 
 A Game Boy Advance emulator written from scratch in Rust, with an alpha 3D mode that draws Pokémon FireRed as a tilted miniature built from the game's own map data.
 
-- **[Download v1.2.0](https://github.com/x0cero/gba/releases/latest)** for macOS, Windows or Linux
+- **[Download v1.2.1](https://github.com/x0cero/gba/releases/latest)** for macOS, Windows or Linux
 - **[Play in the browser](https://x0cero.github.io/gba/)** (2D only, drop in your own `.gba`)
 - [Changelog](CHANGELOG.md)
 

@@ -22,6 +22,7 @@ use gba::bus::Bus;
 use gba::ppu::{self, Capture};
 
 mod actors;
+mod connections;
 mod interiors;
 #[cfg(test)]
 mod map_audit;
@@ -259,12 +260,6 @@ impl Art {
     #[inline]
     fn bot_at(&self, slot: usize, x: usize, y: usize) -> u32 {
         self.bot[slot * 256 + y * 16 + x]
-    }
-
-    /// Top layer alone; SKIP where the metatile draws nothing over its ground.
-    #[inline]
-    fn top_at(&self, slot: usize, x: usize, y: usize) -> u32 {
-        self.top[slot * 256 + y * 16 + x]
     }
 
     /// A copy of `slot` carrying pixels the game drew rather than the ones the
@@ -583,6 +578,7 @@ thread_local! {
 /// A restored save state starts a new timeline. Neither scroll integration
 /// nor tileset-change detection can reuse observations from the old one.
 pub fn reset_history() {
+    connections::reset();
     CAM.with(|c| c.set(None));
     ART_SNAP.with(|s| *s.borrow_mut() = (usize::MAX, Vec::new(), 0));
 }
@@ -732,6 +728,15 @@ impl MapGrid {
     /// gMapHeader (-> ROM map layout -> tilesets -> metatiles + attributes),
     /// gSaveBlock1Ptr (player map coordinates = camera).
     pub fn read(bus: &Bus, cap: Option<&Capture>) -> Option<MapGrid> {
+        // FireRed keeps the overworld map in RAM throughout a battle. Its
+        // mode-0 battle background can also match stale map art, especially
+        // behind Oak's tutorial dialogue. Use the engine's scene flag before
+        // consulting graphics or map pointers. gMain is at 0x030030F0;
+        // Main.inBattle is bit 1 at +0x439 (pret/pokefirered include/main.h).
+        if bus.rom.get(0xAC..0xB0) == Some(b"BPRE") && bus.iwram[0x3529] & 2 != 0 {
+            reset_history();
+            return None;
+        }
         let rd8 = |a: u32| -> Option<u8> {
             match a >> 24 {
                 0x02 => bus.ewram.get((a as usize) & 0x3_FFFF).copied(),
@@ -837,7 +842,9 @@ impl MapGrid {
         // routes and caves are everything else. Measured: Pallet Town and
         // Viridian City read 1, Oak's lab and the Viridian Pokemon Center
         // read 8.
-        let indoors = matches!(rd8(0x0203_6DFC + 0x17), Some(8 | 9));
+        let map_type = rd8(0x0203_6DFC + 0x17);
+        let indoors = matches!(map_type, Some(8 | 9));
+        let cave = map_type == Some(4);
         if dbg {
             eprintln!("grid: map {mapw}x{maph} conn={conn:02X} indoors={indoors}");
         }
@@ -850,6 +857,11 @@ impl MapGrid {
         // which tiled out into a wall of counters on all four sides of the
         // room. Outside a room there is nothing to draw.
         let border = (!indoors).then(|| Border::read(layout, &rd8)).flatten();
+        let neighbors = if !indoors && conn != 0 {
+            connections::read_cached(bus, (sb1 as usize) & 0x3_FFFF)
+        } else {
+            Vec::new()
+        };
         // Live grid entry: metatile id 0-9, collision 10-11, elevation 12-15.
         // VMap coordinates are map coordinates + 7 (the border margin).
         let entry = |gx: i32, gy: i32| -> Option<u16> {
@@ -893,7 +905,17 @@ impl MapGrid {
                     }
                 }
             }
-            // Past the live grid or on an unconnected edge: tile the border
+            // The 3D view reaches beyond the engine's seven-cell neighbor
+            // strip. Continue with the actual adjoining ROM layout instead
+            // of placing the current map's border trees across its entrance.
+            if outside {
+                for neighbor in &neighbors {
+                    if let Some(e) = neighbor.at(&bus.rom, gx, gy) {
+                        return e;
+                    }
+                }
+            }
+            // Past known maps or on an unconnected edge: tile the border
             // block. This is what the real game draws past the map boundary
             // (trees around Pallet Town, darkness around interiors).
             if let Some(b) = &border {
@@ -1217,6 +1239,49 @@ impl MapGrid {
         // long a vertical run of blocked cells happens to be. A tree border
         // and a house wall are both tall runs of blocked cells; extruding both
         // is what turned Pallet's tree line into a smeared hedge.
+        // Some outdoor tree tips occupy a walkable cell above the trunk.
+        // Their atlas row is two rows before the canopy, not one. Collision
+        // alone misses those tips and leaves them painted flat on the ground.
+        let tree_tip = |gx: i32, gy: i32| -> bool {
+            if indoors || cave {
+                return false;
+            }
+            let (Some(e), Some(below)) = (entry(gx, gy), entry(gx, gy + 1)) else {
+                return false;
+            };
+            if behavior(e) != 0 || !solid(gx, gy + 1) || (e & 0x3FF) + 2 * META_ROW != below & 0x3FF
+            {
+                return false;
+            }
+            let (s, b) = (slot_of(e), slot_of(below));
+            let a = art.borrow();
+            a.leaf[s] && a.leaf[b] && a.cover[s] > 0.05 && a.cover[s] < 0.75
+        };
+        // This house family has two roof rows and two facade rows. Match
+        // the complete tile pattern so green roofs cannot become vegetation.
+        let house_row = |gx: i32, gy: i32| -> Option<u8> {
+            if indoors || cave || !(0x280..=0x2ac).contains(&(entry(gx, gy)? & 0x3ff)) {
+                return None;
+            }
+            for k in 0..4 {
+                for dx in 0..5 {
+                    let (x, y) = (gx - dx, gy - k);
+                    let id = |x, y| entry(x, y).map(|e| e & 0x3ff);
+                    let Some(roof) = id(x, y) else { continue };
+                    if !matches!(roof, 0x280 | 0x2a8) {
+                        continue;
+                    }
+                    if (0..5).all(|i| {
+                        id(x + i, y) == Some(roof + i as u16)
+                            && id(x + i, y + 1) == Some(0x288 + i as u16)
+                            && id(x + i, y + 2) == Some(0x290 + i as u16)
+                    }) {
+                        return Some(k as u8);
+                    }
+                }
+            }
+            None
+        };
         let kind = |gx: i32, gy: i32| -> Kind {
             if blackout(gx, gy) {
                 return Kind::Open;
@@ -1224,6 +1289,12 @@ impl MapGrid {
             let Some(e) = entry(gx, gy) else {
                 return Kind::Open;
             };
+            if house_row(gx, gy).is_some() {
+                return Kind::Struct;
+            }
+            if tree_tip(gx, gy) {
+                return Kind::Plant;
+            }
             if e >> 10 & 3 == 0 || is_water(e) {
                 return Kind::Open;
             }
@@ -1317,6 +1388,11 @@ impl MapGrid {
         let hstep = |west: u16, east: u16| -> bool {
             west + 1 == east || (west & 1 == 0 && east & 1 == 1 && west >> 3 == east >> 3)
         };
+        // Adjacent trees share alternate trunk-edge tiles. Preserve the
+        // left/right half and atlas row, not the exact column variant.
+        let vstep = |north: u16, south: u16| -> bool {
+            north / META_ROW + 1 == south / META_ROW && north & 1 == south & 1
+        };
         let unit = |cx: i32, cy: i32| -> (i32, i32, u8, u8) {
             let (gx, gy) = (gx0 + cx, gy0 + cy);
             let (mut ax, mut ay) = (gx, gy);
@@ -1330,7 +1406,7 @@ impl MapGrid {
             while gy - ay < 3
                 && plant_id(ax, ay - 1)
                     .zip(plant_id(ax, ay))
-                    .is_some_and(|(n, c)| n + META_ROW == c)
+                    .is_some_and(|(n, c)| vstep(n, c) || tree_tip(ax, ay - 1))
             {
                 ay -= 1;
             }
@@ -1346,13 +1422,18 @@ impl MapGrid {
             while h < 4
                 && plant_id(ax, ay + h)
                     .zip(plant_id(ax, ay + h - 1))
-                    .is_some_and(|(s, c)| s == c + META_ROW)
+                    .is_some_and(|(s, c)| vstep(c, s) || tree_tip(ax, ay + h - 1))
             {
                 h += 1;
             }
             (ax - gx0, ay - gy0, w as u8, h as u8)
         };
 
+        if !indoors && !cave {
+            for id in [1, 0x0e, 0x0f, 0x1e, 0x1f, 0x26, 0x27] {
+                slot_of(id);
+            }
+        }
         let mut cells = Vec::with_capacity(Self::COLS * Self::ROWS);
         let mut slots = Vec::with_capacity(Self::COLS * Self::ROWS);
         let mut height = Vec::with_capacity(Self::COLS * Self::ROWS);
@@ -1374,39 +1455,59 @@ impl MapGrid {
                     height.push(0.0);
                     continue;
                 }
-                let cell = match kind_at(cx, cy) {
-                    Kind::Plant => {
-                        let (ax, ay, w, h) = unit(cx, cy);
-                        Cell::Tree {
-                            w,
-                            h,
-                            dx: (cx - ax) as u8,
-                            dy: (cy - ay) as u8,
-                        }
+                let cell = if let Some(k) = house_row(gx, gy) {
+                    Cell::Block {
+                        h: 32.0,
+                        n: 4,
+                        k,
+                        wall: 2,
                     }
-                    Kind::Thin => Cell::Bill,
-                    Kind::Struct => {
-                        let cell = Self::structure(gx, gy, &kind, &entry);
-                        match cell {
-                            // Outdoor buildings keep the roof in the first
-                            // structural row and the facade below it. Folding
-                            // only the last row put windows on the roof.
-                            Cell::Block { n, k, wall, .. } if !indoors && n >= 4 && wall > 0 => {
-                                Cell::Block {
-                                    h: 32.0,
-                                    n,
-                                    k,
-                                    wall: n - 1,
-                                }
+                } else {
+                    match kind_at(cx, cy) {
+                        Kind::Plant => {
+                            let (ax, ay, w, h) = unit(cx, cy);
+                            Cell::Tree {
+                                w,
+                                h,
+                                dx: (cx - ax) as u8,
+                                dy: (cy - ay) as u8,
                             }
-                            _ => cell,
                         }
+                        Kind::Thin => Cell::Bill,
+                        // Cave rock is continuous terrain, not a building with
+                        // a roof strip and a facade. Preserve each source tile
+                        // once at a uniform elevation, including long rock runs.
+                        Kind::Struct if cave => Cell::Block {
+                            h: STEP,
+                            n: 1,
+                            k: 0,
+                            wall: 0,
+                        },
+                        Kind::Struct => {
+                            let cell = Self::structure(gx, gy, &kind, &entry);
+                            match cell {
+                                // Outdoor buildings keep the roof in the first
+                                // structural row and the facade below it. Folding
+                                // only the last row put windows on the roof.
+                                Cell::Block { n, k, wall, .. }
+                                    if !indoors && n >= 4 && wall > 0 =>
+                                {
+                                    Cell::Block {
+                                        h: 32.0,
+                                        n,
+                                        k,
+                                        wall: n - 1,
+                                    }
+                                }
+                                _ => cell,
+                            }
+                        }
+                        Kind::Open if is_water(e) => Cell::Water,
+                        Kind::Open => match behavior(e) {
+                            0x02 | 0x03 => Cell::Grass,
+                            _ => Cell::Flat,
+                        },
                     }
-                    Kind::Open if is_water(e) => Cell::Water,
-                    Kind::Open => match behavior(e) {
-                        0x02 | 0x03 => Cell::Grass,
-                        _ => Cell::Flat,
-                    },
                 };
                 height.push(match cell {
                     Cell::Water => WATER,
@@ -1490,21 +1591,22 @@ impl MapGrid {
                 height[i] = 0.0;
             }
         }
-        // A modeled tree must not keep its old canopy painted onto its floor.
+        // A tree must not keep its old canopy painted onto its floor.
         // Choose the prevalent green walkable tile from the entire map, so
         // forest ground stays the same as the camera moves or enters a margin.
         let mut ground_counts = [0u32; 1024];
-        if models::enabled() && !indoors {
+        if !indoors && !cave {
             for y in (0..maph).step_by((maph / 64).max(1) as usize) {
                 for x in (0..mapw).step_by((mapw / 64).max(1) as usize) {
                     if let Some(e) = entry(x, y)
                         && e & 0x0C00 == 0
                         && !is_water(e)
+                        && behavior(e) == 0
                     {
                         let s = slot_of(e);
                         let c = art.borrow().flat[s];
                         let (r, g, b) = (c >> 16 & 255, c >> 8 & 255, c & 255);
-                        if g * 10 > r * 11 && g > b && g > 24 {
+                        if art.borrow().cover[s] <= 0.05 && g * 10 > r * 11 && g > b && g > 24 {
                             ground_counts[(e & 0x3FF) as usize] += 1;
                         }
                     }
@@ -1517,15 +1619,32 @@ impl MapGrid {
             .max_by_key(|&(_, n)| n)
             .filter(|&(_, &n)| n > 0)
             .map(|(id, _)| slot_of(id as u16))
-            .unwrap_or(0);
+            .unwrap_or_else(|| if !indoors && !cave { slot_of(1) } else { 0 });
         let back_wall = indoors
             && mapw >= 6
-            && (0..mapw).all(|x| (0..2).all(|y| solid(x, y) && !is_dark(x, y)));
+            && (0..2).all(|y| {
+                // Plants and fixtures can leave a few nonblocking cells in
+                // an otherwise continuous wall. The wall must not inherit
+                // the varying heights of counters touching it.
+                (0..mapw).filter(|&x| solid(x, y) && !is_dark(x, y)).count() * 4
+                    >= mapw as usize * 3
+            });
         let lab = indoors
             && (mapw, maph) == (13, 14)
             && [(8, 4, 0x2A8), (9, 4, 0x2A9), (10, 4, 0x2AA), (1, 8, 0x073)]
                 .iter()
                 .all(|&(x, y, id)| entry(x, y).is_some_and(|e| e & 0x3ff == id));
+        let mart = indoors
+            && (mapw, maph) == (11, 9)
+            && [
+                (0, 3, 0x2a8),
+                (3, 3, 0x2a5),
+                (7, 3, 0x296),
+                (8, 6, 0x2af),
+                (1, 6, 0x2c1),
+            ]
+            .iter()
+            .all(|&(x, y, id)| entry(x, y).is_some_and(|e| e & 0x3ff == id));
         let mut interior = vec![interiors::Part::Ordinary; cells.len()];
         if indoors {
             for cy in 0..Self::ROWS as i32 {
@@ -1538,6 +1657,37 @@ impl MapGrid {
                         interiors::classify(gx0 + cx, gy0 + cy, back_wall, lab, &|x, y| {
                             entry(x, y).map(&behavior).unwrap_or(0)
                         });
+                    if mart {
+                        let (x, y) = (gx0 + cx, gy0 + cy);
+                        for (left, top, w, n) in
+                            [(0, 3, 3, 2), (1, 5, 2, 2), (7, 3, 2, 4), (10, 3, 1, 4)]
+                        {
+                            if (left..left + w).contains(&x) && (top..top + n).contains(&y) {
+                                interior[i] = interiors::Part::Ordinary;
+                                cells[i] = Cell::Block {
+                                    h: 8.0,
+                                    n: n as u8,
+                                    k: (y - top) as u8,
+                                    wall: 1,
+                                };
+                                height[i] = 8.0;
+                            }
+                        }
+                        if x == 3 && (1..=4).contains(&y) {
+                            interior[i] = interiors::Part::Register((y - 1) as u8);
+                            cells[i] = if y == 1 {
+                                Cell::Block {
+                                    h: 32.0,
+                                    n: 1,
+                                    k: 0,
+                                    wall: 0,
+                                }
+                            } else {
+                                Cell::Flat
+                            };
+                            height[i] = if y == 1 { 32.0 } else { 0.0 };
+                        }
+                    }
                     let h = match interior[i] {
                         interiors::Part::Shelf(1) => Some(20.0),
                         interiors::Part::Table(0) | interiors::Part::Desk(1) => Some(8.0),
@@ -1593,7 +1743,7 @@ impl MapGrid {
         }
         if trace() {
             eprintln!(
-                "TRACE cam {camx} {camy} fine {} {} gx0 {gx0} gy0 {gy0} player {px} {py} map {mapw} {maph}",
+                "TRACE cam {camx} {camy} fine {} {} gx0 {gx0} gy0 {gy0} player {px} {py} map {mapw} {maph} conn {conn}",
                 fine.0, fine.1
             );
         }
@@ -2222,35 +2372,19 @@ impl Renderer {
                         }
                         continue;
                     }
-                    // The floor under every cell of the unit is the grass next
-                    // door in shadow. Painting the tree's own metatile flat is
-                    // what put a pale green shelf under each canopy.
-                    // THE FLOOR UNDER A TREE.
-                    //
-                    // A tree metatile draws its canopy in the top layer over a
-                    // ground layer that is the very patch of shadowed grass the
-                    // tree stands in. That ground layer is the right floor, and
-                    // laying it down is not the old "canopy as a pale shelf"
-                    // bug, which came from painting the COMPOSITE flat.
-                    //
-                    // Borrowing a neighbour's floor instead is what made tree
-                    // lines look hacked apart: floor_near takes the closest
-                    // walkable cell in any direction, so a tree column running
-                    // beside a sand path stood on SAND, and every gap the
-                    // billboards left between them showed a bright tan wedge
-                    // where the game draws shade. A tree only borrows now when
-                    // its whole picture lives in the ground layer and it has no
-                    // ground of its own to fall back on.
-                    let (gs, dark) = g.floor_near(cx, cy);
-                    let own = g.art.cover[slot] > 0.05;
+                    // Never paint a second tree flat under its billboard or
+                    // borrow a road tile into the forest. FireRed's primary
+                    // outdoor turf supplies the forest floor texture.
+                    let turf = g.model_floor;
                     self.quad_uv(ground, &mut |u, v| {
                         let px = (u * 16.0).clamp(0.0, 15.0) as usize;
                         let py = (v * 16.0).clamp(0.0, 15.0) as usize;
-                        if own {
-                            shade(g.art.bot_at(slot, px, py), dark)
+                        let c = if g.indoors {
+                            g.art.bot_at(slot, px, py)
                         } else {
-                            shade(g.art.comp_at(gs, px, py), dark)
-                        }
+                            g.art.comp_at(turf, px, py)
+                        };
+                        shade(c, 0.88)
                     });
                     if dx != 0 || dy != 0 {
                         continue; // the unit's north-west cell carries the tree
@@ -2258,7 +2392,20 @@ impl Renderer {
                     let (w, h) = (w as i32, h as i32);
                     let xe = g.ox + (cx + w) as f32 * STEP;
                     let zbase = g.oz - (cy + h) as f32 * STEP; // unit's south edge
-                    let (aw, ah) = ((w * 16) as f32, (h * 16) as f32);
+                    // Dense border metatiles contain overlapping fragments,
+                    // not standalone sprites. Use the complete tree from the
+                    // same primary tileset at each existing map anchor.
+                    let border_tree = !g.indoors
+                        && w == 2
+                        && (2..=3).contains(&h)
+                        && (0x0e..=0x1f).any(|id| g.art.slot[id] == slot as i32)
+                        && [0x0e, 0x0f, 0x1e, 0x1f, 0x26, 0x27]
+                            .iter()
+                            .all(|&id| g.art.slot[id] >= 0);
+                    let (aw, ah) = (
+                        (w * 16) as f32,
+                        if border_tree { 48.0 } else { (h * 16) as f32 },
+                    );
                     // HOW FAR INTO THE WOOD THIS TREE IS.
                     //
                     // Every tree in a block is the same picture as the one in
@@ -2291,20 +2438,17 @@ impl Renderer {
                     self.quad_uv(q, &mut |u, v| {
                         let px = (u * aw).clamp(0.0, aw - 0.5);
                         let py = (v * ah).clamp(0.0, ah - 0.5);
-                        let src = g.slot_at(cx + px as i32 / 16, cy + py as i32 / 16, slot);
-                        let (ax, ay) = (px as usize % 16, py as usize % 16);
-                        let c = g.art.comp_at(src, ax, ay);
-                        // The unit's transparent edges: where the metatile
-                        // draws nothing of its own over its ground layer and
-                        // that ground pixel is exactly the grass beside the
-                        // tree, the pixel is background, not canopy. Cutting
-                        // it out is what lets a free-standing tree read as a
-                        // tree rather than a rectangle of turf stood on end.
-                        if g.art.top_at(src, ax, ay) == SKIP && c == g.art.comp_at(gs, ax, ay) {
-                            SKIP
+                        let src = if border_tree {
+                            let ids = [[0x0e, 0x0f], [0x1e, 0x1f], [0x26, 0x27]];
+                            g.art.slot[ids[py as usize / 16][px as usize / 16]] as usize
                         } else {
-                            shade(c, gloom)
-                        }
+                            g.slot_at(cx + px as i32 / 16, cy + py as i32 / 16, slot)
+                        };
+                        let (ax, ay) = (px as usize % 16, py as usize % 16);
+                        // Keep the ground on the floor. Its opaque pixels must
+                        // not write billboard depth through transparent foliage.
+                        let c = g.art.object_at(src, ax, ay);
+                        if c == SKIP { SKIP } else { shade(c, gloom) }
                     });
                     self.marking = NO_TREE;
                     continue;
@@ -2604,10 +2748,13 @@ impl Renderer {
         }
         let player_fig = best_player.map(|(_, f)| f);
         let mut actor_anchors = vec![None; boxes.len()];
+        let mut actor_bounds = vec![None; boxes.len()];
         for (id, anchor) in mgrid.actors.anchors.iter().enumerate() {
             let g = group[128 + id];
             if g != usize::MAX {
-                actor_anchors[root(&mut find, g)] = *anchor;
+                let figure = root(&mut find, g);
+                actor_anchors[figure] = *anchor;
+                actor_bounds[figure] = Some(boxes[g]);
             }
         }
 
@@ -2620,6 +2767,15 @@ impl Renderer {
             let mut min_x = pixels.iter().map(|i| i % W).min().unwrap() as f32 - PAD as f32;
             let mut max_x = pixels.iter().map(|i| i % W).max().unwrap() as f32 + 1.0 - PAD as f32;
             let mut top = pixels.iter().map(|i| i / W).min().unwrap() as f32 - PAD as f32;
+            // A grass-rustle overlay can trail below the actor by ten pixels.
+            // It may cover the actor's legs, but must never change the actor's
+            // own quad bounds or its foot line as that effect animates.
+            if let Some(b) = actor_bounds[fig] {
+                min_x = (b[0] - PAD) as f32;
+                max_x = (b[1] + 1 - PAD) as f32;
+                top = (b[2] - PAD) as f32;
+                feet = (b[3] + 1 - PAD) as f32;
+            }
             // A FIGURE HALF OFF THE SCREEN IS STILL STANDING SOMEWHERE.
             //
             // Every extent above is the extent of what the PPU DREW, so an
@@ -2916,23 +3072,6 @@ impl Renderer {
 }
 
 impl MapGrid {
-    /// Floor art to paint under a plant, plus how much to darken it: the
-    /// nearest cell that is real walkable ground, searched outward, with only
-    /// a hint of shade. The 2D art draws no shadow under a tree at all, and a
-    /// deep one laid a dark horizontal stripe across the bottom of every
-    /// canopy row -- the band that made the border read as shelves.
-    fn floor_near(&self, cx: i32, cy: i32) -> (usize, f32) {
-        for r in 1..=3i32 {
-            for (dx, dy) in [(0, r), (r, 0), (-r, 0), (0, -r)] {
-                let (nx, ny) = (cx + dx, cy + dy);
-                if matches!(self.at(nx, ny), Cell::Flat | Cell::Grass) {
-                    return (self.slot_at(nx, ny, 0), 0.88);
-                }
-            }
-        }
-        (self.slot_at(cx, cy, 0), 0.70)
-    }
-
     /// Art slot of a cell in the window, falling back to `def` outside it.
     /// Only volumes taller than the north or south margin can reach outside,
     /// which happens many cells beyond the visible frame.
@@ -3209,5 +3348,100 @@ mod occlusion_tests {
         assert_ne!(r.buffer[15 * WIDTH + 15], 0x333333);
         assert_eq!(r.buffer[15 * WIDTH + 25], 0xff0000);
         assert_eq!(r.buffer[foreground], 0x00ff00);
+    }
+}
+
+#[cfg(test)]
+mod battle_tests {
+    use super::*;
+
+    #[test]
+    fn battle_flag_discards_overworld_history_before_map_detection() {
+        let mut rom = vec![0; 0xC0];
+        rom[0xAC..0xB0].copy_from_slice(b"BPRE");
+        let mut bus = Bus::new(rom);
+        bus.iwram[0x3529] = 2;
+        CAM.with(|c| {
+            c.set(Some(Cam {
+                hofs: 0,
+                vofs: 0,
+                x: 100,
+                y: 100,
+                map: 0x02001000,
+            }))
+        });
+        ART_SNAP.with(|s| *s.borrow_mut() = (0, vec![1; 2048], 4));
+        assert!(MapGrid::read(&bus, None).is_none());
+        assert!(CAM.with(|c| c.get()).is_none());
+        assert!(ART_SNAP.with(|s| s.borrow().1.is_empty()));
+    }
+
+    #[test]
+    #[ignore = "requires GBA_BATTLE_STATE with a local FireRed rival battle state"]
+    fn rival_battle_frames_match_the_original_framebuffer() {
+        let bytes = std::fs::read(std::env::var("GBA_BATTLE_STATE").unwrap()).unwrap();
+        let (mut cpu, _) =
+            bincode::decode_from_slice::<gba::cpu::Cpu, _>(&bytes, bincode::config::standard())
+                .unwrap();
+        assert_eq!(cpu.bus.rom.get(0xAC..0xB0), Some(b"BPRE".as_slice()));
+        assert_ne!(cpu.bus.iwram[0x3529] & 2, 0, "fixture must start in battle");
+        let mut cap = Capture::default();
+        let mut renderer = Renderer::new();
+        let mut battle_frames = 0;
+        let mut field_frames = 0;
+        for frame in 0..6000 {
+            loop {
+                let cycles = match cpu.regs[15] >> 24 {
+                    3 => 1,
+                    2 => 3,
+                    _ => 4,
+                };
+                cpu.step();
+                cpu.bus.tick(cycles);
+                if cpu.bus.frame_ready {
+                    cpu.bus.frame_ready = false;
+                    break;
+                }
+            }
+            cpu.bus.audio.clear();
+            // Left then Up selects the first move; A advances text and attacks.
+            let keys = match frame % 60 {
+                0..=3 => 0x20,
+                10..=13 => 0x40,
+                20..=23 => 1,
+                _ => 0,
+            };
+            cpu.bus.keyinput = 0x03FFu16 & !keys;
+            cap.run(&cpu.bus.io, &cpu.bus.palette, &cpu.bus.vram, &cpu.bus.oam);
+            let grid = MapGrid::read(&cpu.bus, Some(&cap));
+            if cpu.bus.iwram[0x3529] & 2 != 0 {
+                battle_frames += 1;
+                assert!(grid.is_none(), "battle frame {frame} became a map");
+                renderer.render(&cap, &cpu.bus.ppu.framebuffer, grid.as_ref());
+                for y in 0..ppu::HEIGHT {
+                    for x in 0..ppu::WIDTH {
+                        let expected = cpu.bus.ppu.framebuffer[y * ppu::WIDTH + x] & 0xFFFFFF;
+                        for dy in 0..3 {
+                            let i = (10 + y * 3 + dy) * WIDTH + 40 + x * 3;
+                            assert_eq!(
+                                &renderer.buffer[i..i + 3],
+                                &[expected; 3],
+                                "battle frame {frame}"
+                            );
+                        }
+                    }
+                }
+            } else if grid.is_some() {
+                field_frames += 1;
+                if field_frames >= 60 {
+                    break;
+                }
+            }
+        }
+        assert!(battle_frames >= 60);
+        assert!(field_frames >= 60, "did not return to the overworld");
+        println!(
+            "{battle_frames} exact 2D battle frames; {field_frames} recovered overworld frames"
+        );
     }
 }

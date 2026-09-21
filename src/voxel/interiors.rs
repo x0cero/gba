@@ -10,6 +10,7 @@ pub(super) enum Part {
     Table(u8),
     Desk(u8),
     Display,
+    Register(u8),
     Machine(u8, u8),
 }
 
@@ -88,6 +89,27 @@ impl Renderer {
             });
         }
         match part {
+            Part::Register(0) => {
+                // The register touches the rear wall but does not replace it.
+                // Use the adjacent wall's background without its decoration.
+                let back = [
+                    project(x0, 32.0, zs),
+                    project(x1, 32.0, zs),
+                    project(x1, 0.0, zs),
+                    project(x0, 0.0, zs),
+                ];
+                self.quad_uv(back, &mut |u, v| {
+                    let y = (v.clamp(0.0, 0.999) * 32.0) as usize;
+                    let src = g.slot_at(cx + 1, cy - 1 + y as i32 / 16, slot);
+                    g.art
+                        .bot_at(src, (u * 16.0).clamp(0.0, 15.0) as usize, y % 16)
+                });
+                let trim = g.art.bot_at(g.slot_at(-g.gx0, cy - 1, slot), 8, 2);
+                self.quad_uv(quad(zs + 4.0, zs, 32.0), &mut |_, _| shade(trim, 0.9));
+                self.render_indoor_art(g, cx, cy, (1, 4), (0.0, 40.0));
+                return true;
+            }
+            Part::Register(_) => return true,
             Part::Desk(1) => {
                 // The desk occupies the blocked row in front of the wall.
                 // Moving that wall back must preserve its projected upper edge.

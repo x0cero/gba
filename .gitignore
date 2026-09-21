@@ -33,3 +33,7 @@ ios/build/
 
 # wasm-bindgen output for the browser demo, rebuilt by scripts/build-wasm.sh.
 web/pkg/
+
+# Python regression harness bytecode.
+__pycache__/
+*.pyc

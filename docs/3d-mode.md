@@ -9,7 +9,7 @@ The game runs exactly as it does in 2D. The 3D renderer changes how each frame i
 - It reads the live map grid out of the game's memory every frame (the map layout, the metatile attributes and the border block), so the geometry always matches the town the player is standing in. Nothing is modelled by hand.
 - Blocked cells (buildings, fences, furniture) are extruded from the map. Trees stand as whole artwork units. Windows and doors stay on building fronts.
 - Characters stay sprites. Active overworld characters are read from the game's object-event list, including the ones outside the original 240x160 screen. A tinted marker shows the player when scenery hides them.
-- Indoors, bookcases combine their cap, shelves and base into solid cabinets, and supported back walls stand upright. Oak's lab has hand-verified profiles for its table, round machine and book stands. Every other piece of furniture goes through the general tile classifier, which is a guess.
+- Indoors, bookcases combine their cap, shelves and base into solid cabinets, and supported back walls stand upright. Oak's lab has hand-verified profiles for its table, round machine and book stands. Viridian's Mart also has verified counter, shelf and register profiles. Unsupported furniture goes through the general tile classifier, which is a guess.
 - Battles and full-screen menus fall back to plain 2D. Dialogue is overlaid on the scene.
 
 The renderer compares the map it predicts against the pixels the game actually drew. When they disagree (battle wipes, warp fades, the title screen), it shows the flat 2D frame for that moment.
@@ -46,7 +46,7 @@ The audit below runs every map layout in the ROM through the scenery renderer, b
 | Variable | Meaning | Default |
 |----------|---------|---------|
 | `GBA_3D_STYLE` | `sprite` (original art) or `modeled` | `sprite` |
-| `GBA_3D_PERSP` | Lens. `3` is flat, `1` is the old wide lens | `3` |
+| `GBA_3D_PERSP` | Lens. `6` is the current flat lens, `1` is the old wide lens | `6` |
 | `GBA_TILT` | Tilt-shift blur, `0` to `3` | `2` for sprite, `0` for modeled |
 | `GBA_3D_WALL` | Wall height. `1` is half height | `1` |
 | `GBA_MARGIN` | Fading at the screen edge | |
@@ -89,6 +89,9 @@ What the audit does not cover: live NPC behaviour, connected-map transitions, an
 - `GBA_3D_GUESS=1` restores the old colour-classifier fallback when no map grid is readable.
 
 ## Known gaps
+
+- Wild-battle entry effects can still distort the 3D camera before the battle flag becomes active. Combat and its return to the overworld have a dedicated replay; the complete starter-selection and battle-entry sequence remains unverified.
+- Neighbor terrain extends into immediate connected maps with matching tilesets. It does not traverse multiple map connections recursively.
 
 - Only FireRed is supported. The map and art decoding assume the FRLG ROM layout.
 - Furniture outside Oak's lab and the Viridian interiors is classified by heuristic.

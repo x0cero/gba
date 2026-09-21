@@ -96,6 +96,15 @@ fn main() -> ExitCode {
     }
 
     if headless {
+        // Reproduce scene-specific bugs from a local state without altering
+        // the live game. The ROM and battery save should be temporary copies.
+        if let Ok(path) = env::var("GBA_LOAD_STATE") {
+            let bytes = std::fs::read(path).expect("failed to read headless state");
+            cpu = bincode::decode_from_slice::<cpu::Cpu, _>(&bytes, bincode::config::standard())
+                .expect("failed to decode headless state")
+                .0;
+            voxel::reset_history();
+        }
         // Run N frames, dump the last one as PPM.
         let frames: u32 = env::var("GBA_FRAMES")
             .ok()
@@ -390,6 +399,7 @@ fn main() -> ExitCode {
         std::fs::write("io.bin", cpu.bus.io).unwrap();
         std::fs::write("pal.bin", cpu.bus.palette).unwrap();
         std::fs::write("ewram.bin", &cpu.bus.ewram).unwrap();
+        std::fs::write("iwram.bin", &cpu.bus.iwram).unwrap();
         std::fs::write("pal.bin", cpu.bus.palette).unwrap();
         std::fs::write("ewram.bin", &cpu.bus.ewram).unwrap();
         return ExitCode::SUCCESS;

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Automated regression checks for the --3d diorama renderer.
 
-Every mechanical property of the diorama is checked here as a number, so the
-fix-one-break-another loop stops needing screenshots. The emulator emits a
+These checks cover selected camera, sprite and scenery regressions.
+They complement visual review and do not establish correctness on every map. The emulator emits a
 machine-readable trace under GBA_3D_TRACE=1: one FRAME marker per rendered
 frame, a TRACE line with the integrated camera, a FIG line per drawn character
 with its anchor in MAP pixels, a SHA of the finished frame, and (under
@@ -90,7 +90,7 @@ BEHIND = "2020-2040:up,2060-2260:right,2280-2300:down,2320-2560:left"
 
 class Frame:
     __slots__ = ("n", "cam", "fine", "player", "figs", "sha", "geom",
-                 "mapsize", "seen", "hide", "trees", "models")
+                 "mapsize", "seen", "hide", "trees", "models", "connections")
 
     def __init__(self, n):
         self.n = n
@@ -101,6 +101,7 @@ class Frame:
         self.trees = {}
         self.geom = {}
         self.models = {}
+        self.connections = 0
 
 
 def run(binary, rom, script, frames, dump_from=LIVE, geom=False, extra=None):
@@ -142,6 +143,8 @@ def parse(text):
             cur.player = (int(f[12]), int(f[13]))
             if len(f) >= 17:
                 cur.mapsize = (int(f[15]), int(f[16]))
+            if len(f) >= 19 and f[17] == "conn":
+                cur.connections = int(f[18])
         elif f[0] == "FIG":
             m = re.match(
                 r"FIG (\d+) box (\S+) (\S+) (\S+) mappix (-?\d+) (-?\d+) "
@@ -173,6 +176,35 @@ def parse(text):
         elif f[0] == "GEOM":
             cur.geom[(int(f[1]), int(f[2]))] = f[3]
     return frames
+
+
+def check_connected_terrain(frames):
+    """The same Route 1 grass remains grass beyond Viridian's live margin."""
+    bad, checked = [], 0
+    for f in frames:
+        # City (23, 47..48) is Route 1 (11, 7..8). Both are tall grass
+        # in the ROM; the old fallback drew border trees from row 47 on.
+        if f.mapsize == (48, 40):
+            cells = [(23, 47), (23, 48)]
+        elif f.mapsize == (24, 40):
+            cells = [(11, 7), (11, 8)]
+        else:
+            continue
+        for cell in cells:
+            kind = f.geom.get(cell)
+            if kind is None:
+                continue
+            checked += 1
+            if kind != "G" and len(bad) < 8:
+                bad.append(f"frame {f.n}: {f.mapsize} {cell} is {kind}, expected grass")
+    if checked < 100:
+        bad.append(f"only {checked} connected terrain samples")
+    sizes = [f.mapsize for f in frames if f.mapsize]
+    transitions = [(a, b) for a, b in zip(sizes, sizes[1:]) if a != b]
+    for pair in [((48, 40), (24, 40)), ((24, 40), (48, 40))]:
+        if pair not in transitions:
+            bad.append(f"missing crossing {pair}")
+    return bad, f"{checked} grass cells across both city/route crossing directions"
 
 
 def player_fig(fr):
@@ -260,10 +292,9 @@ def settled(frames):
 
 
 def check_figures(frames):
-    """No drawn figure stands outside the map, and once a map has settled none
-    of them stands over a cell the diorama leaves empty. Both were the same
-    bug: the player and the NPCs beside him drawn one or two rows off the
-    floor, hanging in the black void south and east of an interior."""
+    """Figures stay on the map or on a valid connected-map player step.
+    Once a map has settled, none stands over a cell the diorama leaves empty.
+    This catches characters hanging over the void around an interior."""
     bad, off, floating = [], 0, 0
     for f in frames:
         if not f.mapsize:
@@ -272,6 +303,18 @@ def check_figures(frames):
         for g in f.figs:
             cx, cy = g["cell"]
             if not (0 <= cx < w and 0 <= cy < h):
+                # A connected-map handoff switches map coordinates before the
+                # player's interpolated feet finish the boundary step. Admit
+                # exactly that one-cell margin, only on a declared connection
+                # with real floor and an anchor matching the game's position.
+                side = (1 if cy == h and 0 <= cx < w else
+                        2 if cy == -1 and 0 <= cx < w else
+                        3 if cx == -1 and 0 <= cy < h else
+                        4 if cx == w and 0 <= cy < h else 0)
+                if (side and f.connections & (1 << side) and g["player"]
+                        and not g["void"]
+                        and max(abs(cx - g["gamecell"][0]), abs(cy - g["gamecell"][1])) <= 1):
+                    continue
                 off += 1
                 if len(bad) < 5:
                     bad.append(f"frame {f.n}: figure {g['idx']} at cell "
@@ -347,6 +390,118 @@ def check_aisle_marker(frames):
     if checked < 20:
         bad.append(f"only {checked} aisle frames checked")
     return bad[:5], f"{checked} frames beside the table, {len(bad)} false occlusions"
+
+
+def check_room_wall(frames, size):
+    """A fixture's collision gap must not give the rear wall a stepped roof."""
+    inside = [f for f in frames if f.mapsize == size and f.geom]
+    bad = []
+    if len(inside) < 20:
+        bad.append(f"only {len(inside)} room frames, expected at least 20")
+    for f in inside:
+        for x in range(size[0]):
+            if f.geom.get((x, 1)) != "K32:1:0:0":
+                bad.append(f"frame {f.n}: inconsistent rear wall at {x},1")
+        if size == (15, 10) and any(cell in f.trees for cell in [(2, 0), (2, 1), (3, 1)]):
+            bad.append(f"frame {f.n}: Center bookcase rendered as a tree")
+        player = player_fig(f)
+        if not player or player["ground"] != 0:
+            bad.append(f"frame {f.n}: missing or raised aisle player")
+    return bad[:5], f"{len(inside)} room frames; uniform rear wall and grounded player"
+
+
+def check_city_houses(frames):
+    bad, checked = [], 0
+    for f in frames:
+        if f.mapsize != (48,40) or not f.geom:
+            continue
+        for top in (8,15):
+            if (24,top) not in f.geom:
+                continue
+            checked += 1
+            for x in range(24,29):
+                for k in range(4):
+                    if f.geom.get((x,top+k)) != f"K32:4:{k}:2":
+                        bad.append(f"frame {f.n}: broken roof/facade at {x},{top+k}")
+    if checked < 20:
+        bad.append(f"only {checked} house samples")
+    return bad[:5], f"{checked} complete house samples with aligned roofs and facades"
+
+
+def check_mart_units(frames):
+    bad, checked = [], 0
+    for f in frames:
+        if f.mapsize != (11,9) or not f.geom:
+            continue
+        checked += 1
+        for left,top,w,n in [(0,3,3,2),(1,5,2,2),(7,3,2,4),(10,3,1,4)]:
+            for x in range(left,left+w):
+                for k in range(n):
+                    if f.geom.get((x,top+k)) != f"K8:{n}:{k}:1":
+                        bad.append(f"frame {f.n}: uneven fixture at {x},{top+k}")
+    if checked < 20:
+        bad.append(f"only {checked} Mart samples")
+    return bad[:5], f"{checked} frames with continuous counters and shelving"
+
+
+def check_route_tips(frames):
+    bad, checked = [], 0
+    for f in frames:
+        if f.mapsize != (24, 40):
+            continue
+        for x in (2, 10, 12, 14):
+            if (x, 14) not in f.geom:
+                continue
+            checked += 1
+            for dx in range(2):
+                for dy in range(3):
+                    if f.geom.get((x + dx, 14 + dy)) != f"T23{dx}{dy}":
+                        bad.append(f"frame {f.n}: incomplete tree at {x},14")
+    if checked < 20:
+        bad.append(f"only {checked} complete tree samples")
+    return bad[:5], f"{checked} tree samples include tip, canopy and trunk"
+
+
+def check_tree_edge_visibility(frames):
+    # At the east end of this walk the player is behind the third crown's
+    # transparent upper corner. Only the tip may cover a small part of him.
+    window = [f for f in frames if 2624 <= f.n <= 2640]
+    bad, ratios = [], []
+    for f in window:
+        h = next((h for h in f.hide if h["player"]), None)
+        if not h or not h["cov"]:
+            bad.append(f"frame {f.n}: missing player visibility sample")
+            continue
+        ratios.append(h["vis"] / h["cov"])
+        if ratios[-1] < 0.95:
+            bad.append(f"frame {f.n}: transparent tree corner hides the player")
+    if len(ratios) != 17:
+        bad.append(f"only {len(ratios)} tree edge samples")
+    return bad[:5], f"{len(ratios)} edge frames; minimum visibility {min(ratios, default=0):.1%}"
+
+
+def check_grass_stride(frames):
+    window = [f for f in frames if 2705 <= f.n <= 2719]
+    bad, feet, grass_frames = [], [], 0
+    for f in window:
+        p = player_fig(f)
+        if not p:
+            bad.append(f"frame {f.n}: missing player during grass stride")
+            continue
+        grass_frames += f.geom.get(p["cell"]) == "G"
+        feet.append(p["feet"])
+        if p["ground"] != 0 or p["maxx"] - p["minx"] != 14:
+            bad.append(f"frame {f.n}: grass changed the actor bounds or height")
+    # The game temporarily replaces grass metatiles during the rustle.
+    # Require grass samples, while checking bounds for the entire effect.
+    if grass_frames < 5:
+        bad.append(f"only {grass_frames} frames with grass beneath the actor")
+    if len(feet) != 15:
+        bad.append(f"only {len(feet)} grass stride frames")
+    span = max(feet) - min(feet) if feet else 0
+    if span > 2:
+        bad.append(f"grass moved the sprite footline by {span}px")
+    return bad[:5], f"{len(feet)} grass frames; footline variation {span}px"
 
 
 def check_npc(frames):
@@ -521,6 +676,7 @@ def main():
     ap.add_argument("--rom", default="/tmp/rom.gba")
     ap.add_argument("--binary", default="./target/release/gba")
     ap.add_argument("--only", default=None)
+    ap.add_argument("--viridian-rom", help="optional ROM with a save outside Viridian Center")
     args = ap.parse_args()
 
     results = []
@@ -532,6 +688,53 @@ def main():
             print(f"        {b}")
 
     want = lambda n: args.only is None or args.only in n
+
+    if args.only == "viridian" and not args.viridian_rom:
+        ap.error("--only viridian requires --viridian-rom and its .sav fixture")
+
+    if args.viridian_rom and want("viridian"):
+        center = run(args.binary, args.viridian_rom,
+                     "1520-1900:up,2250-2350:right,2380-2480:down,2510-2610:left",
+                     2650, dump_from=2200, geom=True)
+        report("viridian.center.wall", *check_room_wall(center, (15, 10)))
+        report("viridian.center.anchor", *check_anchor(center, 2200, 2650))
+        report("viridian.center.figures", *check_figures(center))
+        # The first visit includes the parcel event. Repeated taps advance its
+        # dialogue; no modified save is copied back to the source fixture.
+        mart_script = "2020-2179:right,2200-2360:up," + ",".join(
+            f"{n}-{n+4}:a" for n in range(2520, 4600, 100))
+        mart = run(args.binary, args.viridian_rom, mart_script + ",4760-4764:b",
+                   4900, dump_from=4780, geom=True)
+        report("viridian.mart.wall", *check_room_wall(mart, (11, 9)))
+        report("viridian.mart.anchor", *check_anchor(mart, 4780, 4900))
+        report("viridian.mart.figures", *check_figures(mart))
+        report("viridian.mart.units", *check_mart_units(mart))
+        city = run(args.binary, args.viridian_rom,
+                   "2020-2083:left,2100-2291:up", 2320, dump_from=2295, geom=True)
+        report("viridian.city.houses", *check_city_houses(city))
+        route = run(args.binary, args.viridian_rom,
+                    "2020-2067:left,2100-2500:down", 2510, dump_from=2000)
+        sizes = {f.mapsize for f in route}
+        report("viridian.route.connection",
+               [] if {(48, 40), (24, 40)} <= sizes else ["city-to-route transition not reached"],
+               "walk from Viridian City into Route 1")
+        report("viridian.route.anchor", *check_anchor(settled(route), 2000, 2510))
+        report("viridian.route.figures", *check_figures(route))
+        connection = run(args.binary, args.viridian_rom,
+                         "2020-2067:left,2100-2350:down,2400-2560:up",
+                         2570, dump_from=2200, geom=True)
+        report("viridian.route.terrain", *check_connected_terrain(connection))
+        grass = run(args.binary, args.viridian_rom,
+                    "2020-2067:left,2100-2500:down,2550-2646:right,2670-2730:up",
+                    2730, dump_from=2670, geom=True)
+        report("viridian.route.treetips", *check_route_tips(grass))
+        report("viridian.grass.stride", *check_grass_stride(grass))
+        report("viridian.grass.anchor", *check_anchor(grass, 2670, 2730))
+        edge = run(args.binary, args.viridian_rom,
+                   "2020-2067:left,2100-2500:down,2520-2535:down,2550-2614:right,2650-2714:left",
+                   2730, dump_from=2510, geom=True)
+        report("viridian.trees.edge", *check_tree_edge_visibility(edge))
+        report("viridian.trees.units", *check_route_tips(edge))
 
     if want("walk") or want("bump") or want("anchor"):
         # Hold Down for 100 frames: one free step south, then a bump against

@@ -27,3 +27,5 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test
+      - name: Regression harness tests
+        run: python3 -B -m unittest discover -s tools -p 'test_*.py'

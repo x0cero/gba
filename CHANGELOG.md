@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.2.1 (2026-09-21)
+
+- Continue adjoining map terrain beyond the engine's live margin, preventing false border trees across the Viridian City and Route 1 entrance.
+
+- Reconstruct dense forest trees from complete original sprites and keep canopy artwork off the ground beneath them.
+- Match Viridian's green-roof house tile patterns so roofs and facades form continuous buildings instead of plant billboards and isolated columns.
+- Keep Mart counters and shelves at consistent heights, and preserve the register artwork without stretching it into a pillar.
+
+- Preserve tree-layer transparency so raised ground-color rectangles cannot hide characters.
+- Join alternate trunk-edge tiles to their crowns, keeping neighboring trees complete and consistently sized.
+
+- Keep grass rustling effects from changing character bounds and producing a vertical bounce.
+- Include walkable treetop tiles in complete tree billboards instead of leaving their crowns flat on the ground.
+
+- Force FireRed battles into the original 2D renderer using the game's battle flag, preventing stale room geometry from covering combat and tutorial dialogue.
+- Add battle-state replay with exact framebuffer checks and recovery to the overworld.
+
+- Keep indoor back walls level when plants or fixtures interrupt their collision tiles, including the Viridian Pokémon Center.
+- Render cave rock formations as terrain with their original tile textures, avoiding repeated house-roof strips.
+- Add Center, Mart and Route 1 gameplay checks, cave geometry assertions and optional scenery review images to the ROM audit.
+
 ## 1.2.0 (2026-09-19)
 
 ### 3D rendering

@@ -88,6 +88,16 @@ fn all_rom_layouts_scenery_and_silhouette() {
     let mut scenes = 0;
     let mut hidden_pixels = 0;
     let mut visible_pixels = 0;
+    // Optional scenery-only review frames, without ROMs or saved game data.
+    let review_dir = std::env::var("GBA_AUDIT_IMAGES").ok();
+    let review_layouts: Vec<usize> = std::env::var("GBA_AUDIT_LAYOUTS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|s| usize::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .collect();
+    if let Some(dir) = &review_dir {
+        std::fs::create_dir_all(dir).unwrap();
+    }
     for &layout in &layouts {
         let (w, h) = (
             word(&bus.rom, layout) as usize,
@@ -134,9 +144,9 @@ fn all_rom_layouts_scenery_and_silhouette() {
         bus.write32(0x0300_5008, 0x0203_0000);
         bus.write32(0x0203_6DFC, 0x0800_0000 + layout as u32);
         bus.write32(0x0203_6E08, 0);
-        // Exercise both boundary policies for every layout. This also avoids
+        // Exercise outdoor, cave and indoor policies for every layout. This avoids
         // relying on inferred map-header identity for shared/unused layouts.
-        for kind in [1, 8] {
+        for kind in [1, 4, 8] {
             bus.write8(0x0203_6E13, kind);
             for (px, py) in [
                 (w / 2, h / 2),
@@ -149,10 +159,38 @@ fn all_rom_layouts_scenery_and_silhouette() {
                 bus.write16(0x0203_0002, py as u16);
                 reset_history();
                 let grid = MapGrid::read(&bus, None).expect("layout did not produce a grid");
+                if kind == 4 {
+                    assert!(
+                        grid.cells.iter().all(|cell| !matches!(
+                            cell,
+                            Cell::Block { n: 2.., .. } | Cell::Block { wall: 1.., .. }
+                        )),
+                        "cave terrain became a building at layout {layout:x}"
+                    );
+                }
                 renderer.zbuf.fill(f32::INFINITY);
                 renderer.buffer.fill(0x333333);
                 renderer.render_world(&grid);
                 assert!(renderer.zbuf.iter().all(|z| !z.is_nan() && *z > 0.0));
+                if let Some(dir) = &review_dir
+                    && review_layouts.contains(&layout)
+                    && (px, py) == (w / 2, h / 2)
+                {
+                    let stem = format!("{dir}/{layout:x}-type{kind}");
+                    crate::dump_frame(&renderer.buffer, WIDTH, HEIGHT, &format!("{stem}-3d.ppm"));
+                    let mut flat = vec![0; ppu::WIDTH * ppu::HEIGHT];
+                    for y in 0..ppu::HEIGHT {
+                        for x in 0..ppu::WIDTH {
+                            let cx = px as i32 - 7 + x as i32 / 16 - grid.gx0;
+                            let cy = py as i32 - 5 + y as i32 / 16 - grid.gy0;
+                            if grid.at(cx, cy) != Cell::Void {
+                                let slot = grid.slot_at(cx, cy, 0);
+                                flat[y * ppu::WIDTH + x] = grid.art.comp_at(slot, x % 16, y % 16);
+                            }
+                        }
+                    }
+                    crate::dump_frame(&flat, ppu::WIDTH, ppu::HEIGHT, &format!("{stem}-flat.ppm"));
+                }
                 renderer.scenery_depth.copy_from_slice(&renderer.zbuf);
                 let (mx, my) = (px as i32 * 16 + 8, py as i32 * 16 + 16);
                 let (wx, wz) = grid.world_of_map(mx, my);

@@ -14,7 +14,7 @@ CI runs the build, the tests, clippy and the [jsmolka/gba-tests](https://github.
 
 The browser build is `scripts/build-wasm.sh`, which writes `web/pkg/` (gitignored). GitHub Pages deploys `web/` on every push to `master`.
 
-Releases are cut by tagging: `git tag v1.2.0 && git push --tags`. The release workflow builds macOS arm64, Linux x86_64 and Windows x86_64 binaries and attaches them to the release. Create the release with its notes first (`gh release create vX.Y.Z --target master --notes-file ...`) so the workflow has somewhere to attach files.
+Releases are cut by tagging: `git tag vX.Y.Z && git push origin vX.Y.Z`. The release workflow builds macOS arm64, Linux x86_64 and Windows x86_64 binaries and attaches them to the release. Create the release with its notes first (`gh release create vX.Y.Z --target master --notes-file ...`) so the workflow has somewhere to attach files.
 
 ## Layout
 
@@ -26,6 +26,7 @@ Releases are cut by tagging: `git tag v1.2.0 && git push --tags`. The release wo
 | `src/psg.rs` | The four legacy Game Boy sound channels |
 | `src/voxel.rs` | 3D mode: map decoding, camera tracking, rasterisation |
 | `src/voxel/actors.rs` | Overworld sprites and positions from FireRed's live object events |
+| `src/voxel/connections.rs` | Adjacent-map terrain beyond the live grid margin |
 | `src/voxel/interiors.rs` | Indoor cabinets, back walls, the lab table profile |
 | `src/voxel/models.rs` | Procedural trees and buildings for `GBA_3D_STYLE=modeled` |
 | `src/voxel/map_audit.rs` | The ROM layout audit |
