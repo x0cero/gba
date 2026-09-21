@@ -10,7 +10,7 @@ A Game Boy Advance emulator written from scratch in Rust, with an alpha 3D mode 
 
 No ROMs are included and none ever will be. Bring your own.
 
-![Pokémon FireRed, Pallet Town rendered in 3D](screenshots/firered-3d-pallet-town.png)
+![Pokémon FireRed, Pallet Town rendered in 3D with v1.2.1](screenshots/firered-3d-pallet-town-v1.2.1.png)
 
 ## 3D mode (alpha)
 
