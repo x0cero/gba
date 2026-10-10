@@ -13,7 +13,7 @@ bincode = { version = "2", features = ["derive"] }
 # Desktop frontend only: neither of these builds for iOS or for wasm32.
 [target.'cfg(all(not(target_os = "ios"), not(target_arch = "wasm32")))'.dependencies]
 cpal = "0.18.1"
-minifb = "0.28.0"
+minifb = "0.29.0"
 
 # Browser frontend only.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
